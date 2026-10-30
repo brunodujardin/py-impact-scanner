@@ -1,3 +1,6 @@
+# py-impact-scanner
+python impact detector and grouping
+
 # Target impact analyser
 
 Desktop app (Python, Tkinter, OpenCV, SQLite) that detects bullet holes on a photo
