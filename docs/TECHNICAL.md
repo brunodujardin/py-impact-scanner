@@ -41,16 +41,17 @@ py-detect-impact/
     ├── __main__.py         entry point, chooses the database path
     ├── detection.py        hole detection (OpenCV)        – no Tk, no SQLite
     ├── stats.py            group statistics, unit conversion – pure Python
-    ├── db.py               SQLite persistence and aggregation
-    ├── images.py           stored photo copies in <db folder>/images/ (resize, JPEG, path resolution)
+    ├── db.py               SQLite persistence, aggregation, settings
+    ├── images.py           stored photo copies in <db folder>/images/ (resize, JPEG, unique names, path resolution)
+    ├── drawstyle.py        display style of impacts and groups (colours, line styles, widths) – pure Python
     └── ui.py               Tkinter application (the only module that imports the others)
 ```
 
-Dependency direction: `ui.py` → `detection.py`, `stats.py`, `db.py`, `images.py`.
-The lower modules do not import each other except `db.py` → `stats.py` (for
-`GroupStats`, `mean_std`, `percentile`) and `db.py` → `images.py` (to delete
-orphaned copies). Keep it that way: detection, stats, db and
-images must stay testable without a display.
+Dependency direction: `ui.py` → `detection.py`, `stats.py`, `db.py`, `images.py`,
+`drawstyle.py`. The lower modules do not import each other except `db.py` → `stats.py`
+(for `GroupStats`, `summarize_groups`) and `db.py` → `images.py` (to delete orphaned
+copies and to derive source names during migration). Keep it that way: detection,
+stats, db, images and drawstyle must stay testable without a display.
 
 Runtime: Python 3.10+ (uses `X | None` annotations with `from __future__ import
 annotations`), Tkinter from the standard library, SQLite from the standard library.
@@ -129,7 +130,7 @@ of shots at most `max_dist` apart joins them. Clusters are numbered in reading o
 
 SQLite file, default `<repo>/targets.db` (see `__main__.py`). Schema is created with
 `CREATE TABLE IF NOT EXISTS` on every start, then `_migrate()` upgrades older files;
-`PRAGMA user_version` holds the schema version (`SCHEMA_VERSION = 2`).
+`PRAGMA user_version` holds the schema version (`SCHEMA_VERSION = 3`).
 
 A **session** is one photo. It owns one or more **groups**; every impact belongs to a
 group.
@@ -139,8 +140,9 @@ CREATE TABLE sessions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at      TEXT NOT NULL,      -- ISO 8601, when saved
     shot_date       TEXT,               -- free text from the form (default: today ISO)
-    image_path      TEXT,               -- "images/<stamp>_<stem>.jpg", relative to the db folder
-                                        -- (absolute path in records from older versions)
+    image_path      TEXT,               -- "images/<stamp>_r<id>_<stem>.jpg", relative to the db folder
+                                        -- (absolute path in records from older versions); see §3.4
+    source_name     TEXT,               -- original file name of the photo ("IMG_5862.jpeg")
     weapon          TEXT,               -- free text, used for filtering (exact match)
     distance        TEXT,
     ammo            TEXT,
@@ -172,10 +174,18 @@ CREATE TABLE impacts (
     y_px        REAL NOT NULL,
     manual      INTEGER NOT NULL DEFAULT 0
 );
+CREATE UNIQUE INDEX idx_sessions_image_path ON sessions(image_path)
+    WHERE image_path LIKE 'images/%';   -- two records never share a stored copy
+CREATE TABLE settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT                    -- "draw_style": DrawStyle JSON (see §5)
+);
 ```
 
 `PRAGMA foreign_keys = ON` is set per connection so deleting a session deletes its
 groups and impacts. Empty groups (no shot) are not stored: `App.save_record` skips them.
+`get_setting(key, default)` / `set_setting(key, value)` (upsert) read and write the
+settings table.
 
 Migrations in `Database._migrate()`:
 
@@ -185,11 +195,25 @@ Migrations in `Database._migrate()`:
   `impacts.group_id`, creates one group `G1` per session that has none, copying the
   session statistics, and attaches the session's impacts to it. It is idempotent (only
   sessions without groups are touched), so an interrupted upgrade finishes next start.
+- `user_version < 3` → `_migrate_v3()`: adds `sessions.source_name` and fills it for
+  existing rows with `images.source_name_of(image_path, all_paths)`: the file name of an
+  absolute path, or the stem inside a stored copy name. A trailing `_<n>` is dropped only
+  when the same path without it exists (then it was a clash suffix, otherwise it is part
+  of the name, as in `IMG_5862`), and nested copy names (a record re-saved after *Load
+  record* by an older version, `20261030_104309_20261029_220754_IMG_5862_2.jpg`) are
+  unwrapped. It then creates the partial unique index; if an old database already
+  shares a copy between records the index is skipped (the shared-copy logic of
+  `delete_session` keeps working).
 
-`Database.save_session(groups: list[GroupRecord], px_per_mm, unit, **meta)` writes the
-session row (totals and means from `summarize_groups`), the group rows and the
-impacts. `get_groups(sid)` / `get_impacts(sid)` read them back; impacts carry
-`group_id` and the UI maps it to the group index by position.
+`Database.save_session(groups: list[GroupRecord], px_per_mm, unit, *, source_name,
+store, **meta)` writes the session row (totals and means from `summarize_groups`), the
+group rows and the impacts **in one transaction**. `store(sid) -> relative_path`, when
+given, is called with the new session id before the commit and writes the photo copy;
+on any exception the transaction is rolled back and a copy already written is deleted,
+so a failed save leaves neither a row nor a file. `sessions_with_source(name)` lists
+the ids saved from a photo of that name (the UI asks before saving another one).
+`get_groups(sid)` / `get_impacts(sid)` read a record back; impacts carry `group_id` and
+the UI maps it to the group index by position.
 
 `Database.aggregate(ids)` pools the **groups** of the given sessions and returns the
 `summarize_groups` dict plus `sessions` (number of sessions). A 25-diagram card thus
@@ -197,18 +221,27 @@ weighs 25 times a single-group photo; the P90 is over groups.
 
 ### 3.4 Stored photo copies (`images.py`)
 
-`store_image(image_bgr, db_path, source_name) -> (relative_path, factor)` writes a
-JPEG copy to `<db folder>/images/<YYYYmmdd_HHMMSS>_<sanitised stem>.jpg`, downscaled
-with `INTER_AREA` so the longest side is at most `MAX_SIDE = 2500` px, quality
-`JPEG_QUALITY = 80` (≈ 0.5 MB for a 2500 px target photo; a PNG was ≈ 4 MB). The
-file is written through `cv2.imencode` + `Path.write_bytes` so non-ASCII paths work.
-Records saved by the short-lived PNG version keep their `.png` path and load fine.
+`store_image(image_bgr, db_path, source_name, record_id) -> (relative_path, factor)`
+writes a JPEG copy to `<db folder>/images/<YYYYmmdd_HHMMSS>_r<record_id>_<sanitised
+stem>.jpg`, downscaled with `INTER_AREA` so the longest side is at most
+`MAX_SIDE = 2500` px, quality `JPEG_QUALITY = 80` (≈ 0.5 MB for a 2500 px target photo;
+a PNG was ≈ 4 MB).
+
+Uniqueness: the record id (AUTOINCREMENT, never reused in a database) makes the name
+unique even when the same photo, or two photos with the same name, are saved several
+times in the same second. The file is opened with mode `"xb"` (exclusive create), so an
+existing file is never overwritten and there is no check-then-write race between two
+running instances; if the name is taken anyway (an old database restored next to a
+newer `images/` folder) `_2`, `_3`, ... is appended. The JPEG is encoded with
+`cv2.imencode` and written by Python's `open`, so non-ASCII paths work (`cv2.imwrite`
+fails on them). `stored_factor(image)` gives the downscale factor without writing,
+which the UI needs before the record id exists. Records saved by the short-lived PNG
+version keep their `.png` path and load fine.
 
 `Database.delete_session(sid)` deletes the row (impacts cascade) and then, if no
 other session references the same `image_path`, calls `delete_stored_image`, which
 only ever removes files inside `<db folder>/images/` (absolute paths from older
 records are never touched). It returns True when a file was removed.
-A name clash appends `_2`, `_3`, ...
 
 `factor` (≤ 1) is the ratio stored-copy pixels / original pixels. `App.save_record`
 multiplies every impact coordinate, every group circle and `px_per_mm` by it before
@@ -375,13 +408,22 @@ run; to inspect the masks, stack them with `np.hstack` after converting to `uint
 
 ## 5. User interface (`ui.py`)
 
-`App(tk.Tk)` with a `ttk.Notebook`: tab *Analyse* and tab *Records & averages*.
+`App(tk.Tk)` with a `ttk.Notebook`: tabs *Analyse*, *Records & averages* and
+*Parameters*. Each tab name has its own background colour (`TAB_COLOURS`: blue, green,
+orange). ttk cannot colour tabs one by one and the Windows theme ignores tab colours,
+so the notebook uses the style `Coloured.TNotebook` whose tab layout is empty (no tab
+row), and `_build` draws a bar of `tk.Label`s instead. A click calls `nb.select`;
+`_update_tab_bar` (on `<<NotebookTabChanged>>`, so `nb.select()` from code works too)
+shows the selected tab in its full colour with white bold text and the others in a
+light tint (`tint(colour, TAB_TINT = 0.7)`), and colours the 4 px strip under the bar.
 
 State held on the `App` instance:
 
 | Attribute | Meaning |
 |---|---|
 | `image_path`, `image_bgr`, `pil_image` | the loaded photo (BGR for OpenCV, PIL RGB for display) |
+| `source_name` | original file name of the photo; *Load record* restores it from the record, so a re-save keeps it instead of the stored copy's name |
+| `style: DrawStyle` | display style, loaded from the `draw_style` setting at start |
 | `view_scale`, `view_off` | fit-to-canvas transform; `_to_view()` / `_to_image()` convert coordinates both ways |
 | `mode` | `None`, `"scale"`, `"add"`, `"remove"` or `"assign"`; `on_click()` dispatches on it |
 | `scale_points`, `px_per_mm` | the 2-point tool and the resulting scale |
@@ -399,24 +441,74 @@ display unit, default 5 cm, or in pixels without a scale), the *assign* click mo
 (moves the nearest impact into `cur_group`). Labels are kept unique
 (`_unique_label`). The *add* mode adds to `cur_group`.
 
-Drawing (`redraw`): each group has a colour from `GROUP_COLOURS` (cycled); its target
-circle (dashed, solid and thick when selected) with the label, its impacts numbered
-within the group (manual ones dashed), its bounding box and centroid cross. The green
-disc from the auto-scale tool is drawn only while no group carries a circle.
+Drawing (`redraw` → `_draw_group_overlay`, one call per group, the selected group
+last so it is on top): target circle with the label, box around the impacts with the
+centroid cross, then the impacts numbered within the group. Each element takes its
+colour, dash and width from `self.style` through `_line(key, group_index)`; the colour
+`"group"` resolves to `GROUP_COLOURS[i % n]`, a palette without red or yellow so the
+defaults stay distinct (impacts yellow `#ffff00` solid 2 px, hand-added impacts yellow
+dashed, groups in palette colours dashed 1 px, selected group red `#ff0000` circle
+solid 4 px and box solid 2 px). The impact radius is `style.impact_radius(zoom)`:
+`impact_size` screen pixels at zoom *fit*, multiplied by the zoom when
+`scale_with_zoom` is true (the default), so a circle keeps the same size relative to the
+photo; the box margin follows it. Line widths and fonts stay in screen pixels. The
+preview always uses `impact_size`. The green disc from the auto-scale tool is drawn only while no group carries a
+circle.
+
+**Display style** (`drawstyle.py`): `DrawStyle(lines: {key: LineStyle(colour, style,
+width)}, impact_size)` for the keys of `ELEMENTS` (`impact`, `impact_manual`,
+`group_circle`, `group_box`, `selected_circle`, `selected_box`). Line styles map to the
+Tk dash strings `"" / "-" / "." / "-."`, the portable form that scales with the width.
+`to_json` / `from_json`: the parser accepts only `#rrggbb` or `"group"`, known styles and
+widths in `WIDTH_RANGE` (1–12), radii in `IMPACT_SIZE_RANGE` (3–40); anything else falls
+back to the default, so a damaged or newer setting never breaks the display.
+
+*Parameters* tab (`_build_params`): one row per element with a colour swatch
+(`colorchooser.askcolor`), a *Group colour* tick box, a line style combobox and a width
+spinbox, plus the impact radius, the *grow with the zoom* switch and *Reset to
+defaults*. Every change goes through
+`_style_from_widgets`, which reads all widgets (a half-typed number is ignored), saves
+the JSON with `set_setting`, redraws the photo and the preview canvas
+(`_draw_preview`: two sample groups drawn with the same `_draw_group_overlay`).
 
 Other key methods: `open_image` / `_load_image` (Pillow loader `load_image()` with EXIF
 transpose and optional `pillow_heif` opener; returns BGR), `analyze` (builds the
 hint, calls `detect_impacts`, takes `impacts` and `groups` from the result),
 `update_stats` (recomputes every `GroupStats`, the photo summary, fills the group table
-and the labels), `save_record` (one `GroupRecord` per non-empty group, coordinates and
-circles scaled by the stored-copy factor), `_refresh_records`, `compute_average`
+and the labels), `save_record` (asks for confirmation when `sessions_with_source`
+finds earlier records from the same file name; one `GroupRecord` per non-empty group,
+coordinates and circles scaled by `stored_factor`; passes a `store` callback so the copy
+is named with the new record id inside the save transaction), `_refresh_records` (the
+table has a *photo* column with `source_name`), `compute_average`
 (pooled group statistics: mean ± std and P90 in both cm and inch, independent of the
 display unit), `load_record` (restores groups and impacts, mapping `group_id` to the
 group position), `delete_records` (rows and orphaned stored copies, see
 `Database.delete_session`).
 
-The canvas image is rebuilt on every `<Configure>` event (resize); there is no zoom.
-Click tolerance for *Remove* and *Move* is `CLICK_TOLERANCE_PX` = 25 screen pixels.
+**Zoom and pan.** `zoom` is relative to "fit to canvas" (1 = whole photo, clamped to
+`[1, ZOOM_MAX = 40]`); `view_scale = fit × zoom` screen px per image px and `view_off`
+is the screen position of image pixel (0, 0). `_update_view()` recomputes both for the
+canvas size (after a resize it keeps the image point at the canvas centre);
+`_clamp_view()` centres an axis on which the photo is smaller than the canvas and
+otherwise forbids panning past the image edge, so near the edges at low zoom the
+point under the cursor can shift. Entry points: `zoom_at(factor, vx, vy)` keeps the
+image point under (vx, vy) fixed (wheel, Ctrl+click = `ZOOM_STEP²`,
+Ctrl+right-click / Ctrl+Shift+click = 1/`ZOOM_STEP²`, `+`/`-` keys and buttons at
+the centre); the slider (`ttk.Scale` on `log(zoom)`, so each step is the same ratio)
+calls `_on_zoom_slider`, and `redraw` sets its variable back, which does not fire the
+command; `zoom_fit` (button, `0`/`Home`); `zoom_to_box` / `zoom_to_group` (button and
+double-click in the group table: the group's circle × 1.1, or the box of its shots plus
+a margin). Pan: right or middle drag always, left drag when no tool is active
+(`_pan_start/_move/_end`). `<Control-Button-1>` is more specific than `<Button-1>`, so
+Tk does not run `on_click` for a Ctrl+click and no tool fires. Keys are bound on the
+canvas, which takes the focus on click, so typing in the entries never zooms.
+
+`redraw` resamples only the visible part of the photo (`Image.resize(..., box=...)`),
+so its cost is bounded by the canvas size: about 25 ms per zoom step on a 12 Mpx photo.
+`BILINEAR` below 4 screen px per image px, `NEAREST` above (crisp pixels for placing a
+shot). Impact circles scale with the zoom (see *Drawing*); click tolerance for *Remove*
+and *Move* is the larger of `CLICK_TOLERANCE_PX` = 25 screen pixels and the impact
+radius, so a click anywhere inside an enlarged circle hits it.
 The scale dialog is a `simpledialog.Dialog` subclass (`ScaleDialog`) returning
 `(value, unit)`.
 
@@ -494,6 +586,8 @@ Hunter card are not found (band broken by a grid line or pencil marks).
   then be exact in every direction.
 - **Scoring**: ring radii are known for ISSF targets; with each `Group`'s circle and
   the scale, each impact's ring value is `floor` of its distance to the group centre.
+- **More display settings**: add a key to `drawstyle.ELEMENTS` and `default_lines()`
+  and use it through `App._line`; the Parameters tab builds its rows from `ELEMENTS`.
 - **Schema changes**: bump `SCHEMA_VERSION`, add a `_migrate_vN()` step in
   `Database._migrate()` guarded by `PRAGMA user_version`; existing users have
   `targets.db` files. Keep every step idempotent.

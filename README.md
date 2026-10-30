@@ -25,24 +25,31 @@ The database is `targets.db` next to this file, with a JPEG copy of every saved 
 2. **Scale**: *Measure 2 points*: click two points on the photo whose real distance
    you know, then enter the length and pick cm or inch. Or *Auto: from outer black
    circle* and enter the diameter of the black (200 mm on a 25 m precision target).
-3. **Analyse impacts**. Shots are drawn as numbered circles in the colour of their
-   group (dashed when added by hand). A photo with several target diagrams (a card of
+3. **Analyse impacts**. Shots are drawn as numbered yellow circles (dashed when
+   added by hand); the selected group has a thick red circle and a red box. A photo with several target diagrams (a card of
    25 small targets) gets one group per diagram automatically; a single target gives
    one group. Torn regions with several shots are split by an estimated count; type
    the number of *Shots fired* before analysing to make that count exact. Use *Add
    impact* / *Remove impact* / *Move impact to selected group* and click on the image
    to correct the detection.
+   Zoom with Ctrl+click / Ctrl+right-click, the mouse wheel or the slider above the
+   photo; pan with a right-drag; *Zoom to group* frames the selected group.
 4. **Groups** (right panel): *New*, *Rename*, *Delete*, *Auto-group: target circles*,
    *Auto-group: distance*. The selected group shows its **width**, **height** and
    **diameter** (extreme spread, centre to centre), in cm or inch; *This image* shows
    the mean ± standard deviation and the P90 diameter over the groups of the photo.
 5. Fill in weapon / distance / ammo / notes and **Save to database** (one record per
-   photo, with all its groups and shots).
+   photo, with all its groups and shots). Each record gets its own photo copy named
+   `<date_time>_r<record>_<original name>.jpg`; saving a photo name that already has a
+   record asks for confirmation and never overwrites.
 6. Tab **Records & averages**: filter by weapon, select records and press
    *Average of selection* for the mean and sample standard deviation of every metric
    over all the groups of the selected records, and the 90th-percentile diameter,
    shown in both cm and inch. *Load record* reopens a saved target with its groups
    and impacts.
+
+Tab **Parameters**: colour, line style and width of impacts, groups and the selected
+group, and the impact circle radius, saved in the database.
 
 ## Detection parameters
 

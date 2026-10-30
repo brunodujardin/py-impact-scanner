@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import tkinter as tk
 from datetime import date
-from math import hypot, pi
+from math import ceil, exp, floor, hypot, log, pi
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
 import cv2
 import numpy as np
@@ -20,16 +20,31 @@ except ImportError:  # pragma: no cover
 
 from .db import Database, GroupRecord
 from .detection import Group, Impact, assign_groups, detect_impacts, find_disc, find_targets
-from .images import resolve_image_path, store_image
+from .drawstyle import (ELEMENTS, GROUP_COLOUR, IMPACT_SIZE_RANGE, LINE_STYLES, WIDTH_RANGE,
+                        DrawStyle)
+from .images import resolve_image_path, source_name_of, store_image, stored_factor
 from .stats import GroupStats, cluster_points, from_unit, group_stats, summarize_groups, to_unit
 
 UNITS = ("cm", "inch")
 DEFAULT_DISC_MM = 200.0  # black disc of a 25 m precision pistol target
 DEFAULT_CLUSTER_MM = 50.0  # "Auto-group by distance": shots closer than this belong together
 IMAGE_EXTS = "*.jpg *.jpeg *.jpe *.png *.heic *.heif *.bmp *.tif *.tiff *.webp"
-GROUP_COLOURS = ("#ff2020", "#20a0ff", "#30d030", "#ffb000", "#e040e0", "#00d0d0",
-                 "#ff70a0", "#a0ff40", "#ff8040", "#8080ff", "#c0a000", "#40e0a0")
-CLICK_TOLERANCE_PX = 25  # screen pixels for the Remove / Assign tools
+# group palette: no red (the selected group) and no yellow (the impacts, by default)
+GROUP_COLOURS = ("#20a0ff", "#30d030", "#e040e0", "#00d0d0", "#8080ff", "#a0ff40",
+                 "#40e0a0", "#c080ff", "#80c0ff", "#ff70ff")
+STYLE_SETTING = "draw_style"  # settings key of the display style (JSON)
+# background colour of each tab name (full colour when selected, a light tint otherwise)
+TAB_COLOURS = {"Analyse": "#2f6db3", "Records & averages": "#2e8b57", "Parameters": "#c96f1e"}
+TAB_TINT = 0.7  # share of white mixed into the colour of an unselected tab
+
+
+def tint(colour: str, amount: float) -> str:
+    """Mix a #rrggbb colour with white (amount 0 = colour, 1 = white)."""
+    r, g, b = (int(colour[i:i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % tuple(round(c + (255 - c) * amount) for c in (r, g, b))
+CLICK_TOLERANCE_PX = 25  # screen pixels for the Remove / Assign tools (at least the circle radius)
+ZOOM_STEP = 1.25         # zoom factor per mouse-wheel notch or +/- press
+ZOOM_MAX = 40.0          # maximum zoom, relative to "fit to window"
 
 
 def load_image(path: str) -> np.ndarray | None:
@@ -89,14 +104,19 @@ class App(tk.Tk):
         self.title("Target impact analyser")
         self.geometry("1500x920")
         self.db = Database(db_path)
+        self.style = DrawStyle.from_json(self.db.get_setting(STYLE_SETTING))
 
         # analysis state
         self.image_path: str | None = None
+        self.source_name = ""  # original file name of the photo (kept through Load record)
         self.image_bgr = None
         self.pil_image: Image.Image | None = None
         self.tk_image = None
-        self.view_scale = 1.0
-        self.view_off = (0, 0)
+        self.view_scale = 1.0       # screen px per image px (= fit scale * zoom)
+        self.view_off = (0.0, 0.0)  # screen position of image pixel (0, 0)
+        self.zoom = 1.0             # 1 = whole image fitted to the canvas
+        self._view_size: tuple[int, int] | None = None  # canvas size used for view_off
+        self._pan_anchor: tuple[float, float, float, float] | None = None
         self.mode: str | None = None
         self.scale_points: list[tuple[float, float]] = []
         self.scale_line_px: float | None = None
@@ -113,15 +133,48 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------------ UI
     def _build(self):
-        self.nb = ttk.Notebook(self)
+        # ttk notebook tabs cannot be coloured one by one (and the Windows theme ignores
+        # tab colours), so the notebook's own tab row is hidden and replaced by a bar of
+        # coloured labels that select the pages
+        style = ttk.Style(self)
+        style.layout("Coloured.TNotebook.Tab", [])
+        style.configure("Coloured.TNotebook", borderwidth=0, tabmargins=0)
+        self.tab_bar = tk.Frame(self)
+        self.tab_bar.pack(fill="x", padx=4, pady=(4, 0))
+        self.tab_strip = tk.Frame(self, height=4)  # colour of the selected tab, joins it to the page
+        self.tab_strip.pack(fill="x", padx=4)
+        self.nb = ttk.Notebook(self, style="Coloured.TNotebook")
         self.nb.pack(fill="both", expand=True)
         self.tab_analyze = ttk.Frame(self.nb)
         self.tab_records = ttk.Frame(self.nb)
-        self.nb.add(self.tab_analyze, text="Analyse")
-        self.nb.add(self.tab_records, text="Records & averages")
+        self.tab_params = ttk.Frame(self.nb)
+        self.tab_labels: dict[str, tk.Label] = {}
+        for frame, text in ((self.tab_analyze, "Analyse"), (self.tab_records, "Records & averages"),
+                            (self.tab_params, "Parameters")):
+            self.nb.add(frame, text=text)
+            lbl = tk.Label(self.tab_bar, text=text, padx=16, pady=5, cursor="hand2", font=("", 10))
+            lbl.pack(side="left", padx=(0, 3))
+            lbl.bind("<Button-1>", lambda e, f=frame: self.nb.select(f))
+            self.tab_labels[str(frame)] = lbl
         self._build_analyze()
         self._build_records()
-        self.nb.bind("<<NotebookTabChanged>>", lambda e: self._refresh_records())
+        self._build_params()
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        self._update_tab_bar()
+
+    def _update_tab_bar(self):
+        current = self.nb.select()
+        for name, lbl in self.tab_labels.items():
+            colour = TAB_COLOURS[lbl.cget("text")]
+            if name == current:
+                lbl.config(bg=colour, fg="white", font=("", 10, "bold"))
+                self.tab_strip.config(bg=colour)
+            else:
+                lbl.config(bg=tint(colour, TAB_TINT), fg=colour, font=("", 10))
+
+    def _on_tab_changed(self, _event=None):
+        self._update_tab_bar()
+        self._refresh_records()
 
     def _build_analyze(self):
         root = self.tab_analyze
@@ -129,8 +182,25 @@ class App(tk.Tk):
         left.pack(side="left", fill="y")
         right = ttk.Frame(root, padding=6, width=360)
         right.pack(side="right", fill="y")
-        self.canvas = tk.Canvas(root, bg="#333", cursor="crosshair")
-        self.canvas.pack(side="left", fill="both", expand=True)
+        centre = ttk.Frame(root)
+        centre.pack(side="left", fill="both", expand=True)
+        zbar = ttk.Frame(centre, padding=(4, 2))
+        zbar.pack(fill="x")
+        ttk.Button(zbar, text="−", width=3, command=lambda: self.zoom_at(1 / ZOOM_STEP)).pack(side="left")
+        ttk.Button(zbar, text="+", width=3, command=lambda: self.zoom_at(ZOOM_STEP)).pack(side="left", padx=2)
+        # the slider works on log(zoom) so every notch is the same relative step
+        self.var_zoom = tk.DoubleVar(value=0.0)
+        self.zoom_slider = ttk.Scale(zbar, from_=0.0, to=log(ZOOM_MAX), orient="horizontal",
+                                     length=180, variable=self.var_zoom, command=self._on_zoom_slider)
+        self.zoom_slider.pack(side="left", padx=4)
+        ttk.Button(zbar, text="Fit", width=5, command=self.zoom_fit).pack(side="left")
+        ttk.Button(zbar, text="Zoom to group", command=self.zoom_to_group).pack(side="left", padx=2)
+        self.lbl_zoom = ttk.Label(zbar, text="Zoom: fit", width=12)
+        self.lbl_zoom.pack(side="left", padx=6)
+        ttk.Label(zbar, foreground="#666",
+                  text="Ctrl+click: in · Ctrl+right-click: out · right-drag: pan").pack(side="left")
+        self.canvas = tk.Canvas(centre, bg="#333", cursor="crosshair", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
 
         # --- left toolbar
         ttk.Button(left, text="1. Open image…", command=self.open_image).pack(fill="x", pady=2)
@@ -196,6 +266,7 @@ class App(tk.Tk):
             self.gtree.column(c, width=w, anchor="center")
         self.gtree.pack(fill="x")
         self.gtree.bind("<<TreeviewSelect>>", self._on_group_select)
+        self.gtree.bind("<Double-1>", lambda e: self.zoom_to_group())
         self.gtree.tag_configure("empty", foreground="#888")
 
         ttk.Label(right, text="Selected group", font=("", 10, "bold")).pack(anchor="w", pady=(6, 0))
@@ -242,6 +313,26 @@ class App(tk.Tk):
 
         self.canvas.bind("<Configure>", lambda e: self.redraw())
         self.canvas.bind("<Button-1>", self.on_click)
+        self.canvas.bind("<B1-Motion>", self._pan_move)
+        self.canvas.bind("<ButtonRelease-1>", self._pan_end)
+        for b in (2, 3):  # middle or right button: pan whatever tool is active
+            self.canvas.bind(f"<Button-{b}>", self._pan_start)
+            self.canvas.bind(f"<B{b}-Motion>", self._pan_move)
+            self.canvas.bind(f"<ButtonRelease-{b}>", self._pan_end)
+        # Ctrl+click zooms at the cursor whatever tool is active (more specific than
+        # <Button-1>, so Tk does not also run on_click / start a pan)
+        self.canvas.bind("<Control-Button-1>", lambda e: self._ctrl_zoom(e, ZOOM_STEP ** 2))
+        self.canvas.bind("<Control-Shift-Button-1>", lambda e: self._ctrl_zoom(e, ZOOM_STEP ** -2))
+        self.canvas.bind("<Control-Button-3>", lambda e: self._ctrl_zoom(e, ZOOM_STEP ** -2))
+        self.canvas.bind("<MouseWheel>", self._on_wheel)  # Windows, macOS
+        self.canvas.bind("<Button-4>", lambda e: self.zoom_at(ZOOM_STEP, e.x, e.y))  # X11
+        self.canvas.bind("<Button-5>", lambda e: self.zoom_at(1 / ZOOM_STEP, e.x, e.y))
+        for key in ("<plus>", "<equal>", "<KP_Add>"):
+            self.canvas.bind(key, lambda e: self.zoom_at(ZOOM_STEP))
+        for key in ("<minus>", "<KP_Subtract>"):
+            self.canvas.bind(key, lambda e: self.zoom_at(1 / ZOOM_STEP))
+        for key in ("<Key-0>", "<KP_0>", "<Home>"):
+            self.canvas.bind(key, lambda e: self.zoom_fit())
 
     def _build_records(self):
         root = self.tab_records
@@ -258,15 +349,15 @@ class App(tk.Tk):
         ttk.Button(top, text="Load record", command=self.load_record).pack(side="left", padx=4)
         ttk.Button(top, text="Delete selected", command=self.delete_records).pack(side="left", padx=4)
 
-        cols = ("id", "shot_date", "weapon", "distance", "ammo", "n_groups", "n_shots",
+        cols = ("id", "shot_date", "source_name", "weapon", "distance", "ammo", "n_groups", "n_shots",
                 "width", "height", "diameter", "notes")
         self.tree = ttk.Treeview(root, columns=cols, show="headings", selectmode="extended")
-        heads = ("id", "date", "weapon", "distance", "ammo", "groups", "shots",
+        heads = ("id", "date", "photo", "weapon", "distance", "ammo", "groups", "shots",
                  "mean width", "mean height", "mean diameter", "notes")
-        widths = (40, 90, 110, 70, 100, 55, 50, 90, 90, 100, 300)
+        widths = (40, 90, 150, 110, 70, 100, 55, 50, 90, 90, 100, 240)
         for c, h, w in zip(cols, heads, widths):
             self.tree.heading(c, text=h)
-            self.tree.column(c, width=w, anchor="center" if c != "notes" else "w")
+            self.tree.column(c, width=w, anchor="w" if c in ("notes", "source_name") else "center")
         self.tree.pack(fill="both", expand=True, padx=6)
         self.lbl_avg = ttk.Label(root, text="Select records and press 'Average of selection'. "
                                             "Averages are taken over the groups of the selected records.",
@@ -291,8 +382,11 @@ class App(tk.Tk):
             messagebox.showerror("Open image", f"Cannot read {path}{hint}")
             return
         self.image_path = path
+        self.source_name = Path(path).name
         self.image_bgr = img
         self.pil_image = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        self.zoom = 1.0
+        self._view_size = None
         self.scale_points.clear()
         self.scale_line_px = None
         self.px_per_mm = None
@@ -313,17 +407,159 @@ class App(tk.Tk):
     def _to_image(self, vx, vy):
         return (vx - self.view_off[0]) / self.view_scale, (vy - self.view_off[1]) / self.view_scale
 
+    # ------------------------------------------------------------ zoom / pan
+    def _canvas_wh(self) -> tuple[int, int]:
+        return max(self.canvas.winfo_width(), 10), max(self.canvas.winfo_height(), 10)
+
+    def _clamp_view(self):
+        """Centre the image on an axis where it is smaller than the canvas; elsewhere
+        keep the canvas covered (no panning past the image edge)."""
+        cw, ch = self._canvas_wh()
+        iw, ih = self.pil_image.size
+
+        def axis(off: float, shown: float, size: int) -> float:
+            if shown <= size:
+                return (size - shown) / 2
+            return min(0.0, max(size - shown, off))
+
+        ox, oy = self.view_off
+        self.view_off = (axis(ox, iw * self.view_scale, cw), axis(oy, ih * self.view_scale, ch))
+
+    def _update_view(self):
+        """Recompute view_scale / view_off for the current canvas size and zoom.
+        After a window resize the image point at the canvas centre stays there."""
+        cw, ch = self._canvas_wh()
+        iw, ih = self.pil_image.size
+        scale = min(cw / iw, ch / ih) * self.zoom
+        if self._view_size is None:
+            self.view_off = (0.0, 0.0)
+        elif self._view_size != (cw, ch):
+            px, py = self._to_image(self._view_size[0] / 2, self._view_size[1] / 2)
+            self.view_off = (cw / 2 - px * scale, ch / 2 - py * scale)
+        self.view_scale = scale
+        self._view_size = (cw, ch)
+        self._clamp_view()
+
+    def zoom_at(self, factor: float, vx: float | None = None, vy: float | None = None):
+        """Multiply the zoom by factor, keeping the image point under (vx, vy)
+        (canvas coordinates, default: canvas centre) in place."""
+        if self.pil_image is None:
+            return
+        self._update_view()
+        cw, ch = self._canvas_wh()
+        if vx is None or vy is None:
+            vx, vy = cw / 2, ch / 2
+        zoom = min(ZOOM_MAX, max(1.0, self.zoom * factor))
+        if zoom == self.zoom:
+            return
+        px, py = self._to_image(vx, vy)
+        self.view_scale *= zoom / self.zoom
+        self.zoom = zoom
+        self.view_off = (vx - px * self.view_scale, vy - py * self.view_scale)
+        self._clamp_view()
+        self.redraw()
+
+    def zoom_fit(self):
+        if self.pil_image is None:
+            return
+        self.zoom = 1.0
+        self.redraw()
+
+    def zoom_to_box(self, x0: float, y0: float, x1: float, y1: float):
+        """Zoom so that the image rectangle fills the canvas, centred."""
+        if self.pil_image is None:
+            return
+        cw, ch = self._canvas_wh()
+        iw, ih = self.pil_image.size
+        fit = min(cw / iw, ch / ih)
+        want = min(cw / max(x1 - x0, 1.0), ch / max(y1 - y0, 1.0))
+        self.zoom = min(ZOOM_MAX, max(1.0, want / fit))
+        self.view_scale = fit * self.zoom
+        self.view_off = (cw / 2 - (x0 + x1) / 2 * self.view_scale, ch / 2 - (y0 + y1) / 2 * self.view_scale)
+        self._view_size = (cw, ch)
+        self._clamp_view()
+        self.redraw()
+
+    def zoom_to_group(self):
+        """Zoom on the selected group: its target circle, or the box of its shots."""
+        gi = self.cur_group
+        if self.pil_image is None or gi is None or gi >= len(self.groups):
+            return
+        g = self.groups[gi]
+        if g.cx is not None:
+            m = g.r * 1.1
+            self.zoom_to_box(g.cx - m, g.cy - m, g.cx + m, g.cy + m)
+            return
+        pts = [(imp.x, imp.y) for imp in self.impacts if imp.group == gi]
+        if not pts:
+            return
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        m = 0.25 * max(max(xs) - min(xs), max(ys) - min(ys)) + (10 * self.px_per_mm if self.px_per_mm else 50)
+        self.zoom_to_box(min(xs) - m, min(ys) - m, max(xs) + m, max(ys) + m)
+
+    def _ctrl_zoom(self, event, factor: float):
+        self.canvas.focus_set()
+        self._pan_anchor = None
+        self.zoom_at(factor, event.x, event.y)
+        return "break"
+
+    def _on_zoom_slider(self, value):
+        """Slider moved by the user: zoom about the canvas centre."""
+        if self.pil_image is None:
+            self.var_zoom.set(0.0)
+            return
+        target = exp(float(value))
+        if abs(target / self.zoom - 1.0) > 1e-3:
+            self.zoom_at(target / self.zoom)
+
+    def _on_wheel(self, event):
+        if event.delta:
+            self.zoom_at(ZOOM_STEP if event.delta > 0 else 1 / ZOOM_STEP, event.x, event.y)
+
+    def _pan_start(self, event):
+        self.canvas.focus_set()  # so the +/-/0 keys reach the canvas
+        if self.pil_image is None:
+            return
+        self._pan_anchor = (event.x, event.y, *self.view_off)
+        self.canvas.config(cursor="fleur")
+
+    def _pan_move(self, event):
+        if self._pan_anchor is None or self.pil_image is None:
+            return
+        x, y, ox, oy = self._pan_anchor
+        before = self.view_off
+        self.view_off = (ox + event.x - x, oy + event.y - y)
+        self._clamp_view()
+        if self.view_off != before:
+            self.redraw()
+
+    def _pan_end(self, _event=None):
+        if self._pan_anchor is not None:
+            self._pan_anchor = None
+            self.canvas.config(cursor="crosshair")
+
     def redraw(self):
         self.canvas.delete("all")
         if self.pil_image is None:
+            self.lbl_zoom.config(text="Zoom: -")
             return
-        cw, ch = max(self.canvas.winfo_width(), 10), max(self.canvas.winfo_height(), 10)
+        self._update_view()
+        cw, ch = self._canvas_wh()
         iw, ih = self.pil_image.size
-        self.view_scale = min(cw / iw, ch / ih)
-        dw, dh = max(1, int(iw * self.view_scale)), max(1, int(ih * self.view_scale))
-        self.view_off = ((cw - dw) // 2, (ch - dh) // 2)
-        self.tk_image = ImageTk.PhotoImage(self.pil_image.resize((dw, dh), Image.BILINEAR))
-        self.canvas.create_image(self.view_off, anchor="nw", image=self.tk_image)
+        s = self.view_scale
+        ox, oy = self.view_off
+        # resample only the visible part of the photo: cost stays bounded at any zoom
+        x0, y0 = max(0, floor(-ox / s)), max(0, floor(-oy / s))
+        x1, y1 = min(iw, ceil((cw - ox) / s)), min(ih, ceil((ch - oy) / s))
+        if x1 > x0 and y1 > y0:
+            sx, sy = round(ox + x0 * s), round(oy + y0 * s)
+            w, h = max(1, round(ox + x1 * s) - sx), max(1, round(oy + y1 * s) - sy)
+            resample = Image.NEAREST if s >= 4 else Image.BILINEAR  # crisp pixels when far in
+            self.tk_image = ImageTk.PhotoImage(
+                self.pil_image.resize((w, h), resample, box=(x0, y0, x1, y1)))
+            self.canvas.create_image(sx, sy, anchor="nw", image=self.tk_image)
+        self.lbl_zoom.config(text="Zoom: fit" if self.zoom == 1.0 else f"Zoom: ×{self.zoom:.1f}")
+        self.var_zoom.set(log(self.zoom))  # setting the variable does not fire the slider command
 
         if self.disc is not None and not any(g.cx is not None for g in self.groups):
             x, y = self._to_view(self.disc.cx, self.disc.cy)
@@ -337,41 +573,186 @@ class App(tk.Tk):
             (x1, y1), (x2, y2) = (self._to_view(*p) for p in self.scale_points)
             self.canvas.create_line(x1, y1, x2, y2, fill="yellow", width=2)
 
-        r = 10
         members = self._members()
-        for gi, g in enumerate(self.groups):
-            colour = group_colour(gi)
-            selected = gi == self.cur_group
-            idx = members.get(gi, [])
+        order = [gi for gi in range(len(self.groups)) if gi != self.cur_group]
+        if self.cur_group is not None and self.cur_group < len(self.groups):
+            order.append(self.cur_group)  # the selected group is drawn last, on top
+        for gi in order:
+            g = self.groups[gi]
+            circle = None
             if g.cx is not None:  # printed target circle the group belongs to
                 x, y = self._to_view(g.cx, g.cy)
-                rr = g.r * self.view_scale
-                self.canvas.create_oval(x - rr, y - rr, x + rr, y + rr, outline=colour,
-                                        width=3 if selected else 1, dash=None if selected else (4, 4))
-                self.canvas.create_text(x - rr + 4, y - rr + 4, text=g.label, fill=colour, anchor="nw",
-                                        font=("", 10, "bold"))
-            for k, i in enumerate(idx, 1):
-                imp = self.impacts[i]
-                x, y = self._to_view(imp.x, imp.y)
-                self.canvas.create_oval(x - r, y - r, x + r, y + r, outline=colour, width=2,
-                                        dash=(3, 2) if imp.manual else None)
-                self.canvas.create_text(x, y - r - 7, text=str(k), fill=colour, font=("", 9, "bold"))
-            if len(idx) > 1:
-                xs = [self.impacts[i].x for i in idx]
-                ys = [self.impacts[i].y for i in idx]
-                x1, y1 = self._to_view(min(xs), min(ys))
-                x2, y2 = self._to_view(max(xs), max(ys))
-                self.canvas.create_rectangle(x1 - r, y1 - r, x2 + r, y2 + r, outline=colour,
-                                             width=2 if selected else 1, dash=(6, 3))
-                cx, cy = self._to_view(sum(xs) / len(xs), sum(ys) / len(ys))
-                self.canvas.create_line(cx - 8, cy, cx + 8, cy, fill=colour, width=2)
-                self.canvas.create_line(cx, cy - 8, cx, cy + 8, fill=colour, width=2)
-                if g.cx is None:
-                    self.canvas.create_text(x1 - r, y1 - r - 4, text=g.label, fill=colour, anchor="sw",
-                                            font=("", 10, "bold"))
-            elif len(idx) == 1 and g.cx is None:
-                x, y = self._to_view(self.impacts[idx[0]].x, self.impacts[idx[0]].y)
-                self.canvas.create_text(x + r + 2, y, text=g.label, fill=colour, anchor="w", font=("", 10, "bold"))
+                circle = (x, y, g.r * self.view_scale)
+            pts = [(*self._to_view(self.impacts[i].x, self.impacts[i].y), self.impacts[i].manual)
+                   for i in members.get(gi, [])]
+            self._draw_group_overlay(self.canvas, gi, g.label, circle, pts, gi == self.cur_group,
+                                     self.style.impact_radius(self.zoom))
+
+    def _line(self, key: str, gi: int) -> tuple[str, int, dict]:
+        """Colour, width and extra canvas options (dash) of a drawing element."""
+        ls = self.style.lines[key]
+        colour = group_colour(gi) if ls.colour == GROUP_COLOUR else ls.colour
+        dash = ls.dash()
+        return colour, ls.width, ({"dash": dash} if dash else {})
+
+    def _draw_group_overlay(self, cv: tk.Canvas, gi: int, label: str,
+                            circle: tuple[float, float, float] | None,
+                            pts: list[tuple[float, float, bool]], selected: bool, r: float):
+        """Draw one group on a canvas, in canvas coordinates: target circle and label,
+        impacts (radius r) numbered within the group, box around the impacts and centre
+        cross. Used for the photo and for the preview of the Parameters tab."""
+        col, w, kw = self._line("selected_circle" if selected else "group_circle", gi)
+        bcol, bw, bkw = self._line("selected_box" if selected else "group_box", gi)
+        font = ("", 11 if selected else 10, "bold")
+        if circle is not None:
+            x, y, rr = circle
+            cv.create_oval(x - rr, y - rr, x + rr, y + rr, outline=col, width=w, **kw)
+            cv.create_text(x - rr + 4, y - rr + 4, text=label, fill=col, anchor="nw", font=font)
+        if len(pts) > 1:
+            xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+            cv.create_rectangle(min(xs) - r, min(ys) - r, max(xs) + r, max(ys) + r,
+                                outline=bcol, width=bw, **bkw)
+            cx, cy = sum(xs) / len(xs), sum(ys) / len(ys)
+            cv.create_line(cx - 8, cy, cx + 8, cy, fill=bcol, width=max(2, bw))
+            cv.create_line(cx, cy - 8, cx, cy + 8, fill=bcol, width=max(2, bw))
+            if circle is None:
+                cv.create_text(min(xs) - r, min(ys) - r - 4, text=label, fill=bcol, anchor="sw", font=font)
+        elif len(pts) == 1 and circle is None:
+            cv.create_text(pts[0][0] + r + 2, pts[0][1], text=label, fill=col, anchor="w", font=font)
+        for k, (x, y, manual) in enumerate(pts, 1):
+            icol, iw, ikw = self._line("impact_manual" if manual else "impact", gi)
+            cv.create_oval(x - r, y - r, x + r, y + r, outline=icol, width=iw, **ikw)
+            cv.create_text(x, y - r - 7, text=str(k), fill=icol, font=("", 9, "bold"))
+
+    # ------------------------------------------------------------ parameters
+    def _build_params(self):
+        root = self.tab_params
+        frm = ttk.Frame(root, padding=12)
+        frm.pack(side="left", fill="y", anchor="n")
+        ttk.Label(frm, text="Display of impacts and groups", font=("", 11, "bold")).grid(
+            row=0, column=0, columnspan=5, sticky="w", pady=(0, 8))
+        for c, txt in enumerate(("Element", "Colour", "Group colour", "Line style", "Width (px)")):
+            ttk.Label(frm, text=txt, font=("", 9, "bold")).grid(row=1, column=c, sticky="w", padx=4)
+        self.style_widgets: dict[str, dict] = {}
+        for row, (key, text) in enumerate(ELEMENTS, start=2):
+            ls = self.style.lines[key]
+            ttk.Label(frm, text=text).grid(row=row, column=0, sticky="w", padx=4, pady=3)
+            swatch = tk.Button(frm, width=7, relief="groove", command=lambda k=key: self._pick_colour(k))
+            swatch.grid(row=row, column=1, padx=4)
+            v_group = tk.BooleanVar(value=ls.colour == GROUP_COLOUR)
+            ttk.Checkbutton(frm, variable=v_group, command=self._style_from_widgets).grid(row=row, column=2)
+            v_style = tk.StringVar(value=ls.style)
+            cb = ttk.Combobox(frm, textvariable=v_style, values=list(LINE_STYLES), state="readonly", width=10)
+            cb.grid(row=row, column=3, padx=4)
+            cb.bind("<<ComboboxSelected>>", lambda e: self._style_from_widgets())
+            v_width = tk.StringVar(value=str(ls.width))
+            sp = ttk.Spinbox(frm, from_=WIDTH_RANGE[0], to=WIDTH_RANGE[1], textvariable=v_width, width=5,
+                             command=self._style_from_widgets)
+            sp.grid(row=row, column=4, padx=4)
+            sp.bind("<KeyRelease>", lambda e: self._style_from_widgets())
+            self.style_widgets[key] = {
+                "swatch": swatch, "group": v_group, "style": v_style, "width": v_width,
+                # colour kept for when "Group colour" is unticked again
+                "custom": ls.colour if ls.colour != GROUP_COLOUR else "#00c0ff",
+            }
+        self._swatch_bg = swatch.cget("bg")
+        row = len(ELEMENTS) + 2
+        ttk.Label(frm, text="Impact circle radius (px)").grid(row=row, column=0, sticky="w", padx=4, pady=(10, 3))
+        self.var_impact_size = tk.StringVar(value=str(self.style.impact_size))
+        sp = ttk.Spinbox(frm, from_=IMPACT_SIZE_RANGE[0], to=IMPACT_SIZE_RANGE[1],
+                         textvariable=self.var_impact_size, width=5, command=self._style_from_widgets)
+        sp.grid(row=row, column=4, padx=4, pady=(10, 3))
+        sp.bind("<KeyRelease>", lambda e: self._style_from_widgets())
+        self.var_scale_zoom = tk.BooleanVar(value=self.style.scale_with_zoom)
+        ttk.Checkbutton(frm, text="Impact circles grow with the zoom (same size on the photo)",
+                        variable=self.var_scale_zoom, command=self._style_from_widgets).grid(
+            row=row + 1, column=0, columnspan=5, sticky="w", padx=4, pady=3)
+        ttk.Button(frm, text="Reset to defaults", command=self._reset_style).grid(
+            row=row + 2, column=0, sticky="w", padx=4, pady=12)
+        ttk.Label(frm, foreground="#666", wraplength=520, justify="left",
+                  text="Changes apply at once to the photo and are saved in the database. "
+                       "'Group colour' uses each group's own colour from the palette instead of "
+                       "the chosen one. The radius is in screen pixels with the whole photo shown "
+                       "(zoom 'fit'); line widths always stay in screen pixels.").grid(
+            row=row + 3, column=0, columnspan=5, sticky="w", padx=4)
+        for key in self.style_widgets:
+            self._update_swatch(key)
+
+        side = ttk.Frame(root, padding=12)
+        side.pack(side="left", fill="both", expand=True, anchor="n")
+        ttk.Label(side, text="Preview", font=("", 11, "bold")).pack(anchor="w", pady=(0, 8))
+        self.preview = tk.Canvas(side, width=520, height=330, bg="#d8d2c4", highlightthickness=1,
+                                 highlightbackground="#999")
+        self.preview.pack(anchor="w")
+        self._draw_preview()
+
+    def _update_swatch(self, key: str):
+        w = self.style_widgets[key]
+        if w["group"].get():
+            w["swatch"].config(bg=self._swatch_bg, activebackground=self._swatch_bg, text="group",
+                               state="disabled")
+        else:
+            w["swatch"].config(bg=w["custom"], activebackground=w["custom"], text="", state="normal")
+
+    def _pick_colour(self, key: str):
+        w = self.style_widgets[key]
+        _, colour = colorchooser.askcolor(color=w["custom"], parent=self,
+                                          title=dict(ELEMENTS)[key] + ": colour")
+        if colour:
+            w["custom"] = colour.lower()
+            w["group"].set(False)
+            self._style_from_widgets()
+
+    def _style_from_widgets(self):
+        """Read the Parameters tab into self.style, save it, redraw."""
+        for key, w in self.style_widgets.items():
+            ls = self.style.lines[key]
+            ls.colour = GROUP_COLOUR if w["group"].get() else w["custom"]
+            if w["style"].get() in LINE_STYLES:
+                ls.style = w["style"].get()
+            try:  # ignore a half-typed value; keep the previous one
+                ls.width = min(WIDTH_RANGE[1], max(WIDTH_RANGE[0], int(w["width"].get())))
+            except ValueError:
+                pass
+            self._update_swatch(key)
+        try:
+            self.style.impact_size = min(IMPACT_SIZE_RANGE[1], max(IMPACT_SIZE_RANGE[0],
+                                                                   int(self.var_impact_size.get())))
+        except ValueError:
+            pass
+        self.style.scale_with_zoom = bool(self.var_scale_zoom.get())
+        self.db.set_setting(STYLE_SETTING, self.style.to_json())
+        self.redraw()
+        self._draw_preview()
+
+    def _reset_style(self):
+        self.style = DrawStyle()
+        for key, w in self.style_widgets.items():
+            ls = self.style.lines[key]
+            w["group"].set(ls.colour == GROUP_COLOUR)
+            if ls.colour != GROUP_COLOUR:
+                w["custom"] = ls.colour
+            w["style"].set(ls.style)
+            w["width"].set(str(ls.width))
+        self.var_impact_size.set(str(self.style.impact_size))
+        self.var_scale_zoom.set(self.style.scale_with_zoom)
+        self._style_from_widgets()
+
+    def _draw_preview(self):
+        """Two sample groups on a paper-coloured background: one normal, one selected."""
+        cv = self.preview
+        cv.delete("all")
+        for cx, gi, label, selected, shots in (
+                (135, 0, "G1", False, ((-30, -20, False), (10, -35, False), (25, 15, False), (-12, 30, True))),
+                (385, 1, "G2", True, ((-25, -30, False), (20, -10, False), (-5, 30, True)))):
+            cy = 160
+            for rr in (110, 85, 60):  # a few printed rings for context
+                cv.create_oval(cx - rr, cy - rr, cx + rr, cy + rr, outline="#333", width=12 if rr == 110 else 1)
+            pts = [(cx + dx, cy + dy, manual) for dx, dy, manual in shots]
+            self._draw_group_overlay(cv, gi, label, (cx, cy, 118), pts, selected, self.style.impact_size)
+        cv.create_text(10, 322, anchor="sw", fill="#444",
+                       text="Left: a group. Right: the selected group. Impact 4 (left) and 3 (right) "
+                            "were added by hand.")
 
     # ---------------------------------------------------------------- groups
     def _members(self) -> dict[int, list[int]]:
@@ -525,10 +906,16 @@ class App(tk.Tk):
         if not self.impacts:
             return None
         i, imp = min(enumerate(self.impacts), key=lambda t: hypot(t[1].x - x, t[1].y - y))
-        return i if hypot(imp.x - x, imp.y - y) * self.view_scale < CLICK_TOLERANCE_PX else None
+        tolerance = max(CLICK_TOLERANCE_PX, self.style.impact_radius(self.zoom))  # click inside the circle
+        return i if hypot(imp.x - x, imp.y - y) * self.view_scale < tolerance else None
 
     def on_click(self, event):
+        self.canvas.focus_set()  # so the +/-/0 keys reach the canvas
+        self._pan_anchor = None
         if self.pil_image is None:
+            return
+        if self.mode is None:  # no tool active: left-drag pans
+            self._pan_start(event)
             return
         x, y = self._to_image(event.x, event.y)
         iw, ih = self.pil_image.size
@@ -692,15 +1079,20 @@ class App(tk.Tk):
             messagebox.showinfo("Save", "Set the scale and detect at least one impact first.")
             return
         f = {k: e.get().strip() for k, e in self.form.items()}
+        earlier = self.db.sessions_with_source(self.source_name)
+        if earlier and not messagebox.askyesno(
+                "Save", f"Record(s) {', '.join('#' + str(i) for i in earlier)} were already saved "
+                        f"from a photo named '{self.source_name}'.\n\nSave another record? It gets "
+                        "its own number and its own photo copy, nothing is overwritten."):
+            return
         # archive a downscaled copy next to the database; coordinates and scale
         # are stored in the copy's pixels so "Load record" lines up exactly
-        rel_path, k = "", 1.0
-        if self.image_bgr is not None:
-            try:
-                rel_path, k = store_image(self.image_bgr, self.db.path, self.image_path or "")
-            except OSError as exc:
-                messagebox.showerror("Save", f"Could not store the image copy:\n{exc}")
-                return
+        k = stored_factor(self.image_bgr) if self.image_bgr is not None else 1.0
+        image_bgr = self.image_bgr
+        store = None
+        if image_bgr is not None:
+            def store(sid: int) -> str:  # called by the db with the new record id
+                return store_image(image_bgr, self.db.path, self.source_name, sid)[0]
         members = self._members()
         records = []
         for gi, g in enumerate(self.groups):
@@ -712,7 +1104,13 @@ class App(tk.Tk):
                                        g.cx * k if g.cx is not None else None,
                                        g.cy * k if g.cy is not None else None,
                                        g.r * k if g.r is not None else None))
-        sid = self.db.save_session(records, self.px_per_mm * k, self.var_unit.get(), image_path=rel_path, **f)
+        try:
+            sid = self.db.save_session(records, self.px_per_mm * k, self.var_unit.get(),
+                                       source_name=self.source_name, store=store, **f)
+        except OSError as exc:
+            messagebox.showerror("Save", f"Could not store the image copy; nothing was saved:\n{exc}")
+            return
+        rel_path = self.db.get_session(sid)["image_path"] or "none"
         skipped = len(self.groups) - len(records)
         msg = f"Saved record #{sid}: {len(records)} group(s), {self.summary['total_shots']} shots, image copy {rel_path}."
         if skipped:
@@ -726,7 +1124,8 @@ class App(tk.Tk):
         unit = self.var_unit.get()
         for r in self.db.list_sessions(self.var_filter.get() or None):
             self.tree.insert("", "end", iid=str(r["id"]), values=(
-                r["id"], r["shot_date"], r["weapon"], r["distance"], r["ammo"], r["n_groups"], r["n_shots"],
+                r["id"], r["shot_date"], r["source_name"] or "", r["weapon"], r["distance"], r["ammo"],
+                r["n_groups"], r["n_shots"],
                 f"{to_unit(r['width_mm'], unit):.2f} {unit}", f"{to_unit(r['height_mm'], unit):.2f} {unit}",
                 f"{to_unit(r['diameter_mm'], unit):.2f} {unit}", r["notes"]))
 
@@ -769,6 +1168,8 @@ class App(tk.Tk):
             messagebox.showwarning("Load", "Image file not found; showing data only.")
             self.image_bgr = None
             self.pil_image = None
+        # keep the original photo name, not the name of the stored copy
+        self.source_name = s["source_name"] or source_name_of(s["image_path"] or "")
         self.var_unit.set(s["unit"])
         self._set_scale(s["px_per_mm"], f"from record #{s['id']}")
         rows = self.db.get_groups(ids[0])

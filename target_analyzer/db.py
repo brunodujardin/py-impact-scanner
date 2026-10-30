@@ -8,14 +8,15 @@ total number of shots and the mean of the group metrics for quick listing.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from .images import delete_stored_image
+from .images import delete_stored_image, source_name_of
 from .stats import GroupStats, summarize_groups
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -23,6 +24,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at      TEXT NOT NULL,
     shot_date       TEXT,
     image_path      TEXT,
+    source_name     TEXT,
     weapon          TEXT,
     distance        TEXT,
     ammo            TEXT,
@@ -55,6 +57,10 @@ CREATE TABLE IF NOT EXISTS impacts (
     x_px        REAL NOT NULL,
     y_px        REAL NOT NULL,
     manual      INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT
 );
 """
 
@@ -94,6 +100,8 @@ class Database:
         version = self.conn.execute("PRAGMA user_version").fetchone()[0]
         if version < 2:
             self._migrate_v2()
+        if version < 3:
+            self._migrate_v3()
         self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         self.conn.commit()
 
@@ -119,42 +127,84 @@ class Database:
                               (cur.lastrowid, s["id"]))
         self.conn.commit()
 
+    def _migrate_v3(self):
+        """Version 3 keeps the original photo file name (source_name) and makes the
+        stored copy path unique. Older records get a name derived from their path."""
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(sessions)")}
+        if "source_name" not in cols:
+            self.conn.execute("ALTER TABLE sessions ADD COLUMN source_name TEXT")
+        paths = {r[0] for r in self.conn.execute("SELECT image_path FROM sessions") if r[0]}
+        for r in self.conn.execute("SELECT id, image_path FROM sessions WHERE source_name IS NULL").fetchall():
+            self.conn.execute("UPDATE sessions SET source_name = ? WHERE id = ?",
+                              (source_name_of(r["image_path"] or "", paths), r["id"]))
+        try:  # only copies in images/; legacy absolute links to originals may repeat
+            self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_image_path "
+                              "ON sessions(image_path) WHERE image_path LIKE 'images/%'")
+        except sqlite3.IntegrityError:
+            pass  # an old database already shares a copy between records: keep it working
+        self.conn.commit()
+
     def close(self):
         self.conn.close()
 
     # -- sessions ---------------------------------------------------------
     def save_session(self, groups: list[GroupRecord], px_per_mm: float, unit: str, *,
-                     image_path: str = "", shot_date: str = "", weapon: str = "",
+                     image_path: str = "", source_name: str = "",
+                     store: Callable[[int], str] | None = None,
+                     shot_date: str = "", weapon: str = "",
                      distance: str = "", ammo: str = "", notes: str = "") -> int:
         """Store one photo with its groups and impacts. Returns the session id.
 
         The session row gets the total shot count and the mean of the group
         metrics (so a single-group record reads exactly like before).
+
+        store, if given, is called with the new session id inside the transaction
+        and must write the photo copy and return its relative path (this puts the
+        record id in the file name). If anything fails, the transaction is rolled
+        back and the copy just written is deleted, so no orphan row or file stays.
         """
         if not groups:
             raise ValueError("a session needs at least one group")
         summary = summarize_groups([g.stats for g in groups])
-        cur = self.conn.execute(
-            """INSERT INTO sessions (created_at, shot_date, image_path, weapon, distance,
-               ammo, notes, unit, px_per_mm, n_groups, n_shots, width_mm, height_mm, diameter_mm)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (datetime.now().isoformat(timespec="seconds"), shot_date, image_path, weapon,
-             distance, ammo, notes, unit, px_per_mm, len(groups), summary["total_shots"],
-             summary["width_mm"][0], summary["height_mm"][0], summary["diameter_mm"][0]))
-        sid = cur.lastrowid
-        for pos, g in enumerate(groups):
-            st = g.stats
-            gcur = self.conn.execute(
-                """INSERT INTO groups (session_id, position, label, cx_px, cy_px, r_px,
-                   n_shots, width_mm, height_mm, diameter_mm) VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (sid, pos, g.label, g.cx_px, g.cy_px, g.r_px, st.n, st.width_mm, st.height_mm,
-                 st.diameter_mm))
-            gid = gcur.lastrowid
-            self.conn.executemany(
-                "INSERT INTO impacts (session_id, group_id, x_px, y_px, manual) VALUES (?,?,?,?,?)",
-                [(sid, gid, x, y, int(m)) for x, y, m in g.points_px])
-        self.conn.commit()
+        written = ""
+        try:
+            cur = self.conn.execute(
+                """INSERT INTO sessions (created_at, shot_date, image_path, source_name, weapon,
+                   distance, ammo, notes, unit, px_per_mm, n_groups, n_shots, width_mm, height_mm,
+                   diameter_mm) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (datetime.now().isoformat(timespec="seconds"), shot_date, image_path, source_name,
+                 weapon, distance, ammo, notes, unit, px_per_mm, len(groups), summary["total_shots"],
+                 summary["width_mm"][0], summary["height_mm"][0], summary["diameter_mm"][0]))
+            sid = cur.lastrowid
+            if store is not None:
+                written = store(sid)
+                self.conn.execute("UPDATE sessions SET image_path = ? WHERE id = ?", (written, sid))
+            for pos, g in enumerate(groups):
+                st = g.stats
+                gcur = self.conn.execute(
+                    """INSERT INTO groups (session_id, position, label, cx_px, cy_px, r_px,
+                       n_shots, width_mm, height_mm, diameter_mm) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (sid, pos, g.label, g.cx_px, g.cy_px, g.r_px, st.n, st.width_mm, st.height_mm,
+                     st.diameter_mm))
+                gid = gcur.lastrowid
+                self.conn.executemany(
+                    "INSERT INTO impacts (session_id, group_id, x_px, y_px, manual) VALUES (?,?,?,?,?)",
+                    [(sid, gid, x, y, int(m)) for x, y, m in g.points_px])
+            self.conn.commit()
+        except BaseException:
+            self.conn.rollback()
+            if written:
+                delete_stored_image(written, self.path)
+            raise
         return sid
+
+    def sessions_with_source(self, source_name: str) -> list[int]:
+        """Ids of the sessions saved from a photo with this file name."""
+        if not source_name:
+            return []
+        rows = self.conn.execute("SELECT id FROM sessions WHERE source_name = ? ORDER BY id",
+                                 (source_name,)).fetchall()
+        return [r["id"] for r in rows]
 
     def list_sessions(self, weapon: str | None = None) -> list[sqlite3.Row]:
         q = "SELECT * FROM sessions"
@@ -193,6 +243,16 @@ class Database:
         if still_used:
             return False
         return delete_stored_image(image_path, self.path)
+
+    # -- settings (key/value, e.g. the display style as JSON) ----------------
+    def get_setting(self, key: str, default: str | None = None) -> str | None:
+        row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row is not None else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) "
+                          "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
+        self.conn.commit()
 
     def weapons(self) -> list[str]:
         rows = self.conn.execute(

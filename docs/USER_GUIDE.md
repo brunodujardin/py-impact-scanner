@@ -54,15 +54,36 @@ The detector works on any phone photo, but these habits make it reliable:
 
 ## 3. The main window
 
-The window has two tabs: **Analyse** and **Records & averages**.
+The window has three tabs: **Analyse** (blue), **Records & averages** (green) and
+**Parameters** (orange). Click a tab name to open it; the open tab is shown in its full
+colour, the others in a light shade.
 
 The Analyse tab has three areas:
 
 | Area | Content |
 |---|---|
 | Left column | The workflow buttons: open image, scale tools, detection parameters, manual correction tools. |
-| Centre | The photo. Click on it when a tool is active. |
+| Centre | The photo, with the zoom bar above it. Click on it when a tool is active. |
 | Right column | The group list with its buttons, the measurements of the selected group, the summary of the photo, the display unit and the save form. |
+
+### 3.1 Zoom and move around the photo
+
+Zoom in to place the scale points or the missing shots precisely, especially on a card
+with many small diagrams.
+
+| Action | How |
+|---|---|
+| Zoom in at a point | **Ctrl + click** on it, or turn the mouse wheel forwards over it. |
+| Zoom out | **Ctrl + right-click** (or Ctrl + Shift + click), or turn the wheel backwards. |
+| Choose the zoom level | Drag the **slider** in the zoom bar, or use the **−** and **+** buttons (or the − and + keys after clicking the photo). |
+| See the whole photo | **Fit** (or the 0 key). |
+| Zoom on one group | Select it in the group list and press **Zoom to group**, or double-click its row. |
+| Move the photo | Drag with the **right** mouse button (works whatever tool is active), or with the left button when no tool is active. |
+
+The zoom level appears in the bar (*fit*, ×2.5, … up to ×40). The impact circles grow
+with the zoom, so they keep the same size relative to the holes (this can be switched
+off in the Parameters tab). Lines keep their width. Ctrl + click never adds or removes a shot, even
+with a tool active. Opening another photo returns to *fit*.
 
 ## 4. Step by step
 
@@ -97,9 +118,10 @@ the app uses it to tell single holes from torn multi-shot regions.
 
 Optionally type the number of **Shots fired**. Then click **Analyse impacts**.
 
-Each detected shot is drawn as a numbered circle in the colour of its group. A dashed
-rectangle shows each group's extent and a cross marks its centre. Detected torn
-regions that contain several shots are split into several points.
+Each detected shot is drawn as a numbered yellow circle. A dashed rectangle in the
+group's colour shows each group's extent and a cross marks its centre. Detected torn
+regions that contain several shots are split into several points. The colours, line
+styles and widths can be changed in the **Parameters** tab (section 6).
 
 If the photo shows **several target diagrams** (a card of 10 or 25 small targets), the
 app finds every black circle and makes one group per diagram: the circles are drawn in
@@ -111,8 +133,8 @@ list. A photo with a single target gives a single group G1.
 
 Automatic detection is good but not perfect. Fix it with the click tools:
 
-- **Add impact (click)**: click on each hole the app missed. These are drawn in
-  orange. The tool stays active until you choose another one.
+- **Add impact (click)**: click on each hole the app missed. These are drawn with a
+  dashed outline. The tool stays active until you choose another one.
 - **Remove impact (click)**: click on a wrong circle to delete it.
 - **Clear all impacts**: start again from zero (useful if you prefer to mark all
   shots by hand). The groups are kept.
@@ -132,9 +154,9 @@ The measurements update immediately after every correction.
 ### 4.5 Groups
 
 The **Groups** list at the top right shows every group with its number of shots and
-its width, height and diameter. Click a row to select a group: it is highlighted on
-the photo, its values appear under *Selected group*, and the *Add impact* and *Move
-impact* tools work on it.
+its width, height and diameter. Click a row to select a group: on the photo it gets a
+thick red circle and a red box, drawn above the other groups; its values appear under
+*Selected group*, and the *Add impact* and *Move impact* tools work on it.
 
 - **New**: creates a group (you can name it; the default is the next G number) and
   switches to *Add impact* so you can click its shots right away. Use it when one
@@ -184,11 +206,20 @@ photo copy stored in `images\`. The original photo is no longer needed afterward
 weapon name is used later for filtering, so write it the same way every time (for
 example `45` or `SP01`).
 
+Every record gets its own photo copy, named with the date and time, the record number
+and the original name (for example `20261030_101530_r12_IMG_5862.jpg`). Saving the
+same photo again, or another photo with the same file name, never overwrites anything.
+The app asks first: *Record(s) #10, #11 were already saved from a photo named
+'IMG_5862.jpeg'. Save another record?* Answer **No** if you saved it already, since a
+duplicate counts twice in the averages. Answer **Yes** for a re-measured target or a
+different photo that happens to share the name. A record reopened with **Load record**
+keeps its original photo name.
+
 ## 5. Records & averages
 
-The second tab lists every saved record (one row per photo) with its number of
-groups, total shots and the **mean** width, height and diameter of its groups, in the
-current display unit.
+The second tab lists every saved record (one row per photo) with the original photo
+file name, its number of groups, total shots and the **mean** width, height and
+diameter of its groups, in the current display unit.
 
 - **Weapon filter**: show only one weapon. Leave empty for all.
 - **Refresh**: reload the list (it also refreshes when you open the tab).
@@ -208,7 +239,31 @@ current display unit.
   their stored photo copies in `images\` when no other record uses them. This cannot
   be undone.
 
-## 6. Detection parameters
+## 6. Display parameters (Parameters tab)
+
+The **Parameters** tab sets how impacts and groups are drawn on the photo. Each line
+has a colour, a *Group colour* tick box, a line style (solid, dashed, dotted,
+dash-dot) and a width in screen pixels:
+
+| Element | Default |
+|---|---|
+| Impact circle | yellow, solid, 2 |
+| Impact added by hand | yellow, dashed, 2 |
+| Group: target circle | group colour, dashed, 1 |
+| Group: box and centre cross | group colour, dashed, 1 |
+| Selected group: target circle | red, solid, 4 |
+| Selected group: box and centre cross | red, solid, 2 |
+
+Click a colour square to choose a colour. Tick **Group colour** to use each group's
+own colour from the palette (blue, green, magenta, cyan, …) instead. **Impact circle
+radius** sets the size of the impact circles when the whole photo is shown (default
+10). With **Impact circles grow with the zoom** ticked (default) they are enlarged
+with the zoom and keep the same size on the photo; untick it to keep them the same
+size on screen at any zoom. The preview on the right and the photo
+update at once. The settings are saved in the database and come back at the next
+start; **Reset to defaults** restores the table above.
+
+## 7. Detection parameters
 
 The defaults work for the target styles the app was tuned on: targets with a solid
 black disc (25 m precision pistol), ring targets with a white centre (10 m air rifle /
@@ -224,7 +279,7 @@ backing. Change a parameter and click **Analyse impacts** again to see its effec
 | Hole core Ø (mm) | 4.0 | The size of the clean part of one hole on your targets. With the scale set, this tells single holes from torn multi-shot regions. For .45 ACP on paper the visible core is about 4 mm; air rifle pellets about 4.5 mm. |
 | Shots fired | empty | Type the real number when you know it: the torn regions are then split into exactly the missing number of shots. |
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 | Symptom | What to do |
 |---|---|
