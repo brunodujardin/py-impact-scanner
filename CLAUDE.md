@@ -11,3 +11,5 @@ group size and stores results in SQLite.
 - After touching `target_analyzer/detection.py`, run
   `.venv\Scripts\python tests\check_samples.py` and inspect `tests\out\*_detected.jpg`.
 - `detection.py` and `stats.py` must stay free of Tk and SQLite imports.
+- `targets.db` in the repo holds real records: test `db.py` changes on a copy. Schema
+  changes go through `SCHEMA_VERSION` + an idempotent `_migrate_vN()` in `db.py`.

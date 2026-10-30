@@ -25,17 +25,24 @@ The database is `targets.db` next to this file, with a JPEG copy of every saved 
 2. **Scale**: *Measure 2 points*: click two points on the photo whose real distance
    you know, then enter the length and pick cm or inch. Or *Auto: from outer black
    circle* and enter the diameter of the black (200 mm on a 25 m precision target).
-3. **Analyse impacts**. Red circles are detected shots, orange ones were added by hand.
-   Torn regions with several shots are split by an estimated count; type the number of
-   *Shots fired* before analysing to make that count exact. Use *Add impact* /
-   *Remove impact* and click on the image to correct the detection.
-4. The right panel shows the group: **width**, **height** and **diameter** (extreme
-   spread, centre to centre), in cm or inch.
-5. Fill in weapon / distance / ammo / notes and **Save to database**.
+3. **Analyse impacts**. Shots are drawn as numbered circles in the colour of their
+   group (dashed when added by hand). A photo with several target diagrams (a card of
+   25 small targets) gets one group per diagram automatically; a single target gives
+   one group. Torn regions with several shots are split by an estimated count; type
+   the number of *Shots fired* before analysing to make that count exact. Use *Add
+   impact* / *Remove impact* / *Move impact to selected group* and click on the image
+   to correct the detection.
+4. **Groups** (right panel): *New*, *Rename*, *Delete*, *Auto-group: target circles*,
+   *Auto-group: distance*. The selected group shows its **width**, **height** and
+   **diameter** (extreme spread, centre to centre), in cm or inch; *This image* shows
+   the mean ± standard deviation and the P90 diameter over the groups of the photo.
+5. Fill in weapon / distance / ammo / notes and **Save to database** (one record per
+   photo, with all its groups and shots).
 6. Tab **Records & averages**: filter by weapon, select records and press
    *Average of selection* for the mean and sample standard deviation of every metric
-   and the 90th-percentile diameter, shown in both cm and inch.
-   *Load record* reopens a saved target with its impacts.
+   over all the groups of the selected records, and the 90th-percentile diameter,
+   shown in both cm and inch. *Load record* reopens a saved target with its groups
+   and impacts.
 
 ## Detection parameters
 
@@ -48,8 +55,9 @@ The database is `targets.db` next to this file, with a JPEG copy of every saved 
 | Hole core Ø (mm) | Expected size of the bright/grey core of a single hole, used with the scale to tell single holes from torn multi-shot regions. |
 | Shots fired | Optional; makes the split of torn regions exact. |
 
-Two target styles are supported: solid black disc (25 m precision pistol) and ring
-targets with a white centre (10 m air rifle / pistol cards, grey or wood backing).
+Target styles supported: solid black disc (25 m precision pistol), ring targets with
+a white centre (10 m air rifle / pistol cards, grey or wood backing) and cards of
+25 small ring diagrams (.22 Hunter), each diagram becoming a group.
 
 `tests\check_samples.py` runs the detector on the photos in `samples\` and writes
 annotated images to `tests\out\`, which is the quickest way to tune the parameters on

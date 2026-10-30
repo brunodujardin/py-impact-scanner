@@ -12,8 +12,12 @@ A Windows desktop application (pure Python) that:
 1. loads a photo of a paper shooting target;
 2. lets the user define the pixel-to-millimetre scale;
 3. detects bullet holes with classical computer vision (OpenCV, no machine learning);
-4. computes group-size statistics (width, height, extreme spread);
-5. persists sessions and impacts in SQLite and aggregates them (mean, sample std-dev).
+4. splits the holes into *groups*: one per printed target diagram when the photo shows
+   a card with several diagrams, otherwise one group; the user can create, delete and
+   re-assign groups;
+5. computes group-size statistics (width, height, extreme spread) per group, per photo
+   (mean ± std-dev over its groups) and over several photos;
+6. persists sessions, groups and impacts in SQLite and aggregates them.
 
 There is no network access, no external service, no model file.
 
@@ -67,8 +71,14 @@ class Impact:          # one shot
     x, y: float        # pixels, ORIGINAL image coordinates
     count: int = 1     # always 1 after splitting (kept for future use)
     area: float = 0.0  # blob area / count, original-pixel units
-    manual: bool       # True if added by the user (drawn orange)
-    group_id: int      # index of the torn blob it was split from, -1 if isolated
+    manual: bool       # True if added by the user (drawn with a dashed outline)
+    blob_id: int       # index of the torn blob it was split from, -1 if isolated
+    group: int = 0     # index into the group list
+
+@dataclass
+class Group:           # a set of shots measured together
+    label: str         # "G1", "G2", ... or user-given
+    cx, cy, r: float | None   # printed target circle (pixels) when the group comes from one
 
 @dataclass
 class DetectionResult:
@@ -77,7 +87,13 @@ class DetectionResult:
     blobs: list[np.ndarray]   # OpenCV contours (original coordinates), for drawing
     single_hole_area: float   # reference area used to classify blobs
     debug: dict               # work-resolution boolean masks: ink, midtone, coloured, candidates
+    targets: list[Disc]       # every circular black shape (target diagrams), largest first
+    groups: list[Group]       # impacts[i].group indexes this list
 ```
+
+The group index is an in-memory concept: deleting a group renumbers the indexes of the
+following groups (`App.delete_group`). The `Group.label` is what the user sees and what
+is stored.
 
 ### 3.2 Statistics (`stats.py`)
 
@@ -99,10 +115,24 @@ scale. `mean_std(values)` returns the mean and the *sample* standard deviation
 percentile with linear interpolation between ranks (same convention as NumPy's
 default); it is used for the P90 diameter.
 
+`summarize_groups(list[GroupStats])` is the one aggregation used at every level
+(photo, selection of records): `{metric: (mean, std)}` for `width_mm, height_mm,
+diameter_mm, n_shots`, plus `count` (groups), `total_shots` and `diameter_p90_mm`.
+Groups are pooled, never weighted by photo.
+
+`cluster_points(points, max_dist)` is single-linkage clustering with a union-find
+(O(n²) pairs, fine for a few hundred shots): two shots belong together when a chain
+of shots at most `max_dist` apart joins them. Clusters are numbered in reading order
+(row bands of `max_dist`, then x). It backs the "Auto-group: distance" button.
+
 ### 3.3 Database (`db.py`)
 
 SQLite file, default `<repo>/targets.db` (see `__main__.py`). Schema is created with
-`CREATE TABLE IF NOT EXISTS` on every start; there is no migration system yet.
+`CREATE TABLE IF NOT EXISTS` on every start, then `_migrate()` upgrades older files;
+`PRAGMA user_version` holds the schema version (`SCHEMA_VERSION = 2`).
+
+A **session** is one photo. It owns one or more **groups**; every impact belongs to a
+group.
 
 ```sql
 CREATE TABLE sessions (
@@ -117,14 +147,27 @@ CREATE TABLE sessions (
     notes           TEXT,
     unit            TEXT NOT NULL,      -- display unit chosen when saved ("cm" | "inch")
     px_per_mm       REAL NOT NULL,      -- scale of the photo
-    n_shots         INTEGER NOT NULL,
-    width_mm        REAL NOT NULL,
+    n_groups        INTEGER NOT NULL DEFAULT 1,
+    n_shots         INTEGER NOT NULL,   -- total over the groups
+    width_mm        REAL NOT NULL,      -- MEAN over the groups (= the group value when n_groups = 1)
     height_mm       REAL NOT NULL,
     diameter_mm     REAL NOT NULL
+);
+CREATE TABLE groups (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    position    INTEGER NOT NULL,       -- display order
+    label       TEXT NOT NULL,
+    cx_px       REAL, cy_px REAL, r_px REAL,   -- target circle in STORED-copy pixels, or NULL
+    n_shots     INTEGER NOT NULL,
+    width_mm    REAL NOT NULL,
+    height_mm   REAL NOT NULL,
+    diameter_mm REAL NOT NULL
 );
 CREATE TABLE impacts (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    group_id    INTEGER REFERENCES groups(id) ON DELETE CASCADE,
     x_px        REAL NOT NULL,          -- pixels of the STORED copy (see §3.4)
     y_px        REAL NOT NULL,
     manual      INTEGER NOT NULL DEFAULT 0
@@ -132,13 +175,25 @@ CREATE TABLE impacts (
 ```
 
 `PRAGMA foreign_keys = ON` is set per connection so deleting a session deletes its
-impacts. `Database._migrate()` runs after the schema: it drops the `mean_radius_mm`
-column that earlier versions stored (`ALTER TABLE ... DROP COLUMN`, needs SQLite
-3.35+; silently kept otherwise). Add future migrations there.
+groups and impacts. Empty groups (no shot) are not stored: `App.save_record` skips them.
 
-`Database.aggregate(ids)` returns `{metric: (mean, std)}` for `width_mm, height_mm,
-diameter_mm, n_shots`, plus `count` (int) and `diameter_p90_mm` (float): the 90th
-percentile of the session diameters, i.e. 90 % of the sessions are at or below it.
+Migrations in `Database._migrate()`:
+
+- drop the `mean_radius_mm` column of the first versions (`ALTER TABLE ... DROP
+  COLUMN`, needs SQLite 3.35+; silently kept otherwise);
+- `user_version < 2` → `_migrate_v2()`: adds `sessions.n_groups` and
+  `impacts.group_id`, creates one group `G1` per session that has none, copying the
+  session statistics, and attaches the session's impacts to it. It is idempotent (only
+  sessions without groups are touched), so an interrupted upgrade finishes next start.
+
+`Database.save_session(groups: list[GroupRecord], px_per_mm, unit, **meta)` writes the
+session row (totals and means from `summarize_groups`), the group rows and the
+impacts. `get_groups(sid)` / `get_impacts(sid)` read them back; impacts carry
+`group_id` and the UI maps it to the group index by position.
+
+`Database.aggregate(ids)` pools the **groups** of the given sessions and returns the
+`summarize_groups` dict plus `sessions` (number of sessions). A 25-diagram card thus
+weighs 25 times a single-group photo; the P90 is over groups.
 
 ### 3.4 Stored photo copies (`images.py`)
 
@@ -156,8 +211,8 @@ records are never touched). It returns True when a file was removed.
 A name clash appends `_2`, `_3`, ...
 
 `factor` (≤ 1) is the ratio stored-copy pixels / original pixels. `App.save_record`
-multiplies every impact coordinate and `px_per_mm` by it before calling
-`save_session`, so a record is self-consistent with its copy and `Load record`
+multiplies every impact coordinate, every group circle and `px_per_mm` by it before
+calling `save_session`, so a record is self-consistent with its copy and `Load record`
 (`resolve_image_path`) shows the impacts at the right place. Group statistics are
 unaffected (they were computed in mm before saving). The original photo is never
 referenced again.
@@ -188,10 +243,21 @@ converted *to* work units (`* scale²`). Kernels that must follow the print size
 ```
 blur_bgr = medianBlur(image, 5)          # removes JPEG noise and paper fibres
 gray     = BGR2GRAY(blur_bgr)
-sat      = BGR2HSV(blur_bgr)[..., 1]     # saturation 0-255
+hue, sat = BGR2HSV(blur_bgr)[..., 0:2]   # hue 0-180, saturation 0-255
+chroma   = max(B,G,R) - min(B,G,R)
 paper_global = percentile(gray, 95)      # the paper is the brightest large surface
-ink      = gray < ink_ratio * paper_global   # printed black (≈ < 100 on a 225 paper)
+dark_wood = (sat > sat_thresh) & (chroma > 40) & (hue <= 30 | hue >= 170)
+ink      = (gray < ink_ratio * paper_global) & ~dark_wood   # printed black (≈ < 100 on a 225 paper)
 ```
+
+`dark_wood` exists because a wooden backing seen through a hole in deep shadow is as
+dark as print (gray 30–55 on the 22 Hunter card) but strongly orange (sat 170–220,
+hue 9–16), whereas print is grey. Such pixels must not be ink, otherwise both hole rules
+below exclude them. The chroma floor keeps warm-lit print (chroma ≤ 40 after the median)
+in the ink mask: lowering it to 20–35 turned the thin ring lines of IMG_5861 and the
+band interiors of IMG_5862 into candidates. The hue test rejects the purple/green
+chromatic fringes along print edges. Very dark wood with chroma below 40 (gray ≈ 30,
+cells 16 and 11 of the card) is still missed and needs a manual add.
 
 ### 4.3 Disc detection (`find_disc`)
 
@@ -278,7 +344,30 @@ The UI passes `hole_area_hint = π·(Ø/2 · px_per_mm)²` with Ø from the "Hol
 median is fragile when many blobs are noise, which is why the status line asks the
 user to set the scale first.
 
-### 4.8 Debug output
+### 4.8 Targets and groups
+
+`find_targets(gray, ink_ratio, min_r_frac=0.03)` reuses the disc search for *every*
+closed ink contour: circularity ≥ 0.7, radius ≥ 3 % of the longest side. It then drops
+shapes smaller than 60 % of the median radius and shapes whose centre lies inside a
+larger kept circle, so the inner rings exposed when a band is torn open are not extra
+targets. `find_disc` is the same search restricted to radius ≥ 5 % and returns the
+largest shape. `detect_impacts` runs `find_targets` at work resolution and converts the
+circles back to original pixels.
+
+`assign_groups(impacts, targets)` gives every impact the index of the nearest target
+centre and returns one `Group` per target (empty ones included, so the user sees the
+diagrams without shots), labelled `G1…Gn` in reading order (`_reading_order`: rows are
+bands of 1.2 × median radius, then x). With fewer than two targets everything goes into
+a single `G1` that carries the disc circle when there is one. Shots far from every
+diagram (on the blank paper between cells) still go to the nearest one; the UI's
+*Move impact to selected group* tool corrects that.
+
+On the 22 Hunter card (`samples/fe341a73-….jpg`, 1440×1920, 25 numbered diagrams plus
+small ones in the margins) 27 of the 30 circles are found; the three missed ones have a
+band broken by the grid line or pencil marks. The circles found are correct and the
+assignment makes no mistake on the 89 default-parameter impacts.
+
+### 4.9 Debug output
 
 `DetectionResult.debug` holds the boolean masks `ink`, `midtone`, `coloured`,
 `candidates` at work resolution. `tests/check_samples.py` shows how to visualise a
@@ -294,24 +383,42 @@ State held on the `App` instance:
 |---|---|
 | `image_path`, `image_bgr`, `pil_image` | the loaded photo (BGR for OpenCV, PIL RGB for display) |
 | `view_scale`, `view_off` | fit-to-canvas transform; `_to_view()` / `_to_image()` convert coordinates both ways |
-| `mode` | `None`, `"scale"`, `"add"` or `"remove"`; `on_click()` dispatches on it |
+| `mode` | `None`, `"scale"`, `"add"`, `"remove"` or `"assign"`; `on_click()` dispatches on it |
 | `scale_points`, `px_per_mm` | the 2-point tool and the resulting scale |
-| `impacts: list[Impact]`, `disc`, `stats` | detection result, user edits, computed `GroupStats` |
+| `impacts: list[Impact]`, `disc` | detection result and user edits; `impact.group` is the group index |
+| `groups: list[Group]`, `cur_group` | the groups and the index selected in the group table |
+| `group_stats: dict[int, GroupStats]`, `summary` | per-group statistics (only groups with shots, only with a scale) and the `summarize_groups` dict for the photo |
 | `var_*` | Tk variables bound to the parameter entries |
 
-Key methods: `open_image` / `_load_image` (Pillow loader `load_image()` with EXIF
+Group handling: `_members()` (group index → impact indexes), `_ensure_group()` (creates
+`G1` when the user adds a shot with no group), `new_group` / `rename_group` /
+`delete_group` (deleting removes the group's impacts after confirmation and renumbers
+the indexes above it), `auto_group_circles` (`find_targets` + `assign_groups` on the
+current impacts), `auto_group_distance` (`cluster_points`; threshold asked in the
+display unit, default 5 cm, or in pixels without a scale), the *assign* click mode
+(moves the nearest impact into `cur_group`). Labels are kept unique
+(`_unique_label`). The *add* mode adds to `cur_group`.
+
+Drawing (`redraw`): each group has a colour from `GROUP_COLOURS` (cycled); its target
+circle (dashed, solid and thick when selected) with the label, its impacts numbered
+within the group (manual ones dashed), its bounding box and centroid cross. The green
+disc from the auto-scale tool is drawn only while no group carries a circle.
+
+Other key methods: `open_image` / `_load_image` (Pillow loader `load_image()` with EXIF
 transpose and optional `pillow_heif` opener; returns BGR), `analyze` (builds the
-hint, calls `detect_impacts`, sets `disc`/`impacts`), `update_stats` (recomputes
-`GroupStats` and refreshes the labels in the chosen unit), `redraw` (resizes the
-image to the canvas and draws disc, scale line, impacts, group box), `save_record`,
-`_refresh_records`, `compute_average` (prints width, height, diameter mean ± std and
-the P90 diameter in both cm and inch, independent of the display unit),
-`load_record` (resolves the stored copy relative to the database folder),
-`delete_records` (rows and orphaned stored copies, see `Database.delete_session`).
+hint, calls `detect_impacts`, takes `impacts` and `groups` from the result),
+`update_stats` (recomputes every `GroupStats`, the photo summary, fills the group table
+and the labels), `save_record` (one `GroupRecord` per non-empty group, coordinates and
+circles scaled by the stored-copy factor), `_refresh_records`, `compute_average`
+(pooled group statistics: mean ± std and P90 in both cm and inch, independent of the
+display unit), `load_record` (restores groups and impacts, mapping `group_id` to the
+group position), `delete_records` (rows and orphaned stored copies, see
+`Database.delete_session`).
 
 The canvas image is rebuilt on every `<Configure>` event (resize); there is no zoom.
-Click tolerance for *Remove* is 25 screen pixels. The scale dialog is a
-`simpledialog.Dialog` subclass (`ScaleDialog`) returning `(value, unit)`.
+Click tolerance for *Remove* and *Move* is `CLICK_TOLERANCE_PX` = 25 screen pixels.
+The scale dialog is a `simpledialog.Dialog` subclass (`ScaleDialog`) returning
+`(value, unit)`.
 
 `__main__.py`: `python -m target_analyzer [db_path]`; default database is
 `<repo>/targets.db`.
@@ -321,25 +428,31 @@ Click tolerance for *Remove* is 25 screen pixels. The scale dialog is a
 There is no unit-test suite yet. Two checks exist:
 
 1. `tests/check_samples.py` – runs `detect_impacts` with defaults on every image in
-   `samples/`, prints blob/impact counts and group sizes (scale assumed from the
-   detected circle = 200 mm, so the cm values are only meaningful for the solid-disc
-   targets) and writes annotated images to `tests/out/`. Run it after any change to
-   `detection.py` and look at the pictures; counts alone can hide regressions.
-2. A scripted Tk smoke test was used during development (load image → auto scale →
-   analyse → 2-point scale → add/remove → save → average → load record). It is not
-   committed; `App` methods can be driven directly as long as a display is available
-   (`app.after(..., run); app.mainloop()`), with `simpledialog.askfloat` and
-   `ScaleDialog` patched via `unittest.mock`.
+   `samples/`, prints blob/impact/target/group counts, the group sizes (scale assumed
+   from the detected circle = 200 mm, so the cm values are only meaningful for the
+   solid-disc targets) and the shots per group, and writes annotated images to
+   `tests/out/` (target circles with `label:count` in green). Run it after any change
+   to `detection.py` and look at the pictures; counts alone can hide regressions.
+2. A scripted Tk smoke test was used during development (load the card → scale →
+   analyse → add / move / remove a shot → delete an empty and a full group → new and
+   rename → save → records table → average → load record and compare → distance
+   clustering on `3.jpg` → load a migrated v1 record). It is not committed; `App`
+   methods can be driven directly as long as a display is available
+   (`app.after(..., run); app.mainloop()`), with `simpledialog.askfloat/askstring`,
+   `messagebox.askyesno/showinfo` and `ScaleDialog` patched via `unittest.mock`. Test
+   the database layer on a *copy* of `targets.db` (the file in the repository holds
+   real records).
 
 When printing the aggregate text on a Windows console set `PYTHONIOENCODING=utf-8`
 (it contains `±` and `σ`).
 
-## 7. Expected behaviour on the two target styles
+## 7. Expected behaviour on the target styles
 
 | Style | Example | Hole appearance | Rules that fire |
 |---|---|---|---|
 | Solid black disc, white ring lines and digits inside (25 m precision pistol, ISSF, black Ø 200 mm) | `samples/1-3.jpg` | bright torn paper on black; holes outside the disc are grey on white | inside: bright > 0.65 paper; outside: midtone |
 | Ring target, white centre, thin black rings, wide black bands, several diagrams per card (10 m air rifle/pistol) | `samples/IMG_58xx.jpeg` | grey backing (gray ≈ 0.65 paper) or wood backing (orange, sat 120–180); also holes on the blank paper between diagrams | midtone and coloured |
+| Card of 25 small ring diagrams (.22 "Hunter" card, 5 × 5 numbered cells plus margin diagrams), one group per cell | `samples/fe341a73-….jpg` | wood backing, from bright orange to nearly black in the phone shadow; black backing in a few cells | coloured, midtone, `dark_wood` exclusion; `find_targets` for the groups |
 
 Measured levels on the samples (after the 5 px median): paper 209–235, ink 15–60
 (up to 125 in a lit corner of the disc), grey backing ≈ 150, wood 108–150 gray with
@@ -353,6 +466,7 @@ hue ≈ 16/180, shadowed warm paper sat 75–90.
 | `samples/2.jpg` | .45, 10 m, solid disc | two big torn regions, few isolated holes |
 | `samples/3.jpg` | SP01, 10 m, solid disc | ≈ 15 clean holes, two small clusters |
 | `samples/IMG_5857–5863.jpeg` | 10 m air targets, iPhone 3024×4032 | grey or wood backing, hard phone shadows, crumpled plastic sleeve, coloured pasters on IMG_5860 |
+| `samples/fe341a73-….jpg` | .22 Hunter card, 25 cells, 1440×1920 | the multi-group sample: ≈ 90 shots in 23 cells, 2–8 per cell; half the card in a hard shadow; two cells with a black backing (undetectable by colour) |
 
 Failure modes fixed during tuning, in order: (1) ring lines and digits detected →
 opening; (2) lit black print detected as midtone → disc override; (3) 4032 px photos
@@ -361,9 +475,15 @@ level; (5) chromatic fringes and warm-lit paper as "coloured" → `gray < 0.9 pa
 and `sat > 95`; (6) a stray tiny blob shrinking the reference area so every hole was
 split → median of the smaller half plus UI hint; (7) thin shadow arcs → solidity.
 
+(8) dark wood in shadow classified as ink and therefore invisible → `dark_wood`
+exclusion (§4.2); on IMG_5860–5863 this also joined the previously fragmented torn
+regions into whole blobs (blob count 21–27 → 5–11 with the same or fewer impacts).
+
 Known leftovers: a thin arc at a shadow boundary on IMG_5861; brightly lit wood
-(> 0.9 paper) partly missed; without a scale, holes may still be over-split; coloured
-pasters are detected as impacts by design (they usually cover real holes).
+(> 0.9 paper) partly missed; nearly black wood (chroma < 40) and black backings missed;
+without a scale, holes may still be over-split; coloured pasters are detected as
+impacts by design (they usually cover real holes); three of the 30 circles of the
+Hunter card are not found (band broken by a grid line or pencil marks).
 
 ## 9. Extension points
 
@@ -372,9 +492,12 @@ pasters are detected as impacts by design (they usually cover real holes).
 - **Perspective correction**: detect the outer circle as an ellipse (`cv2.fitEllipse`
   on the disc contour) and warp to a circle before detection; the scale tool would
   then be exact in every direction.
-- **Scoring**: ring radii are known for ISSF targets; with `Disc` and the scale, each
-  impact's ring value is `floor` of its distance to the centre.
-- **Schema changes**: add `PRAGMA user_version` handling in `Database.__init__` before
-  altering tables; existing users have `targets.db` files.
+- **Scoring**: ring radii are known for ISSF targets; with each `Group`'s circle and
+  the scale, each impact's ring value is `floor` of its distance to the group centre.
+- **Schema changes**: bump `SCHEMA_VERSION`, add a `_migrate_vN()` step in
+  `Database._migrate()` guarded by `PRAGMA user_version`; existing users have
+  `targets.db` files. Keep every step idempotent.
+- **Group labels from the print**: the cell numbers of a card could be read (template
+  matching of the digits) to label the groups 1–25 instead of G1–G27 in reading order.
 - **Tests**: `detection.py` and `stats.py` are display-free; pytest cases can assert
   impact counts within a tolerance on `samples/` and exact values on synthetic images.

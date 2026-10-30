@@ -2,8 +2,10 @@
 
 The Target Impact Analyser measures your shooting groups from a photo of the target.
 You open the photo, tell the app the scale, let it find the bullet holes, correct
-anything it got wrong, and save the result. Over time the saved records give you the
-average group size per weapon, with its standard deviation.
+anything it got wrong, and save the result. A photo can hold several groups (a card
+with many small diagrams, or several series on one target): each group is measured on
+its own, and the photo gets the mean and spread of its groups. Over time the saved
+records give you the average group size per weapon, with its standard deviation.
 
 ## 1. Installation (Windows)
 
@@ -60,7 +62,7 @@ The Analyse tab has three areas:
 |---|---|
 | Left column | The workflow buttons: open image, scale tools, detection parameters, manual correction tools. |
 | Centre | The photo. Click on it when a tool is active. |
-| Right column | Live group measurements, display unit, and the save form. |
+| Right column | The group list with its buttons, the measurements of the selected group, the summary of the photo, the display unit and the save form. |
 
 ## 4. Step by step
 
@@ -95,9 +97,15 @@ the app uses it to tell single holes from torn multi-shot regions.
 
 Optionally type the number of **Shots fired**. Then click **Analyse impacts**.
 
-Each detected shot is drawn as a numbered red circle. A dashed cyan rectangle shows
-the group extent and a cyan cross marks its centre. Detected torn regions that
-contain several shots are split into several points.
+Each detected shot is drawn as a numbered circle in the colour of its group. A dashed
+rectangle shows each group's extent and a cross marks its centre. Detected torn
+regions that contain several shots are split into several points.
+
+If the photo shows **several target diagrams** (a card of 10 or 25 small targets), the
+app finds every black circle and makes one group per diagram: the circles are drawn in
+the group colours with their names (G1, G2, … in reading order) and every shot is
+assigned to the nearest diagram. Diagrams without any shot appear greyed in the group
+list. A photo with a single target gives a single group G1.
 
 ### 4.4 Correct the detection
 
@@ -107,7 +115,10 @@ Automatic detection is good but not perfect. Fix it with the click tools:
   orange. The tool stays active until you choose another one.
 - **Remove impact (click)**: click on a wrong circle to delete it.
 - **Clear all impacts**: start again from zero (useful if you prefer to mark all
-  shots by hand).
+  shots by hand). The groups are kept.
+- **Move impact to selected group (click)**: select the destination group in the list,
+  then click the shots to move there (for example a shot that landed between two
+  diagrams and was assigned to the wrong one).
 
 Typical things to correct:
 
@@ -118,13 +129,39 @@ Typical things to correct:
 
 The measurements update immediately after every correction.
 
-### 4.5 Read the results
+### 4.5 Groups
 
-The right column shows, in the chosen **display unit** (cm or inch):
+The **Groups** list at the top right shows every group with its number of shots and
+its width, height and diameter. Click a row to select a group: it is highlighted on
+the photo, its values appear under *Selected group*, and the *Add impact* and *Move
+impact* tools work on it.
+
+- **New**: creates a group (you can name it; the default is the next G number) and
+  switches to *Add impact* so you can click its shots right away. Use it when one
+  target carries several series shot one after the other, or when the automatic
+  grouping missed a diagram.
+- **Rename**: changes the name of the selected group (for example the cell number
+  printed on the card).
+- **Delete**: removes the selected group **and its shots** after confirmation. To keep
+  the shots, move them to another group first with *Move impact to selected group*.
+- **Auto-group: target circles**: redoes the automatic grouping by printed circle on
+  the current shots (after you added shots by hand, for example). Needs at least two
+  circles in the photo.
+- **Auto-group: distance**: groups the shots by proximity. Shots closer than the
+  distance you type (default 5 cm) end up in the same group. Use it for several
+  series on a plain target without printed circles; pick a distance smaller than the
+  gap between the series and larger than the spread inside one.
+
+Empty groups are shown in grey, are not measured and are not saved.
+
+### 4.6 Read the results
+
+The right column shows, in the chosen **display unit** (cm or inch), for the
+**selected group**:
 
 | Value | Meaning |
 |---|---|
-| Shots | Number of impact points. |
+| Shots | Number of impact points in the group. |
 | Width | Horizontal spread, centre of the leftmost hole to centre of the rightmost. |
 | Height | Vertical spread, centre to centre. |
 | Diameter (extreme spread) | Largest centre-to-centre distance between two holes. This is the usual "group size". |
@@ -132,42 +169,51 @@ The right column shows, in the chosen **display unit** (cm or inch):
 All values are centre to centre. To get an edge-to-edge group size, add one bullet
 diameter to the diameter value.
 
-### 4.6 Save the record
+Under **This image** you get the same figures over all the groups of the photo that
+contain shots: number of groups and total shots, then the **mean ± standard
+deviation** of the width, height and diameter, and the **P90 diameter** (90 % of the
+groups are at or below it). With a single group the means equal the group values and
+the deviations are 0.
+
+### 4.7 Save the record
 
 Fill in the form (date, weapon, distance, ammunition, notes) and click
-**Save to database**. The status line confirms the record number and the name of the
+**Save to database**. One record is saved for the photo with all its groups and shots;
+the status line confirms the record number, the number of groups and the name of the
 photo copy stored in `images\`. The original photo is no longer needed afterwards. The
 weapon name is used later for filtering, so write it the same way every time (for
 example `45` or `SP01`).
 
 ## 5. Records & averages
 
-The second tab lists every saved record with its measurements in the current display
-unit.
+The second tab lists every saved record (one row per photo) with its number of
+groups, total shots and the **mean** width, height and diameter of its groups, in the
+current display unit.
 
 - **Weapon filter**: show only one weapon. Leave empty for all.
 - **Refresh**: reload the list (it also refreshes when you open the tab).
 - **Average of selection**: select one or more rows (Ctrl-click or Shift-click) and
-  press the button. The box below shows, for width, height, diameter and number of
-  shots, the **mean ± sample standard deviation** over the selected records, in
-  **both cm and inch** side by side (whatever the display unit). The line
-  **Diameter P90** is the 90th percentile of the diameters: 90 % of the selected
-  records have a group diameter at or below this value, which makes it a good
-  "what I can count on" figure.
+  press the button. The box below shows, for width, height, diameter and shots per
+  group, the **mean ± sample standard deviation** over **all the groups** of the
+  selected records, in **both cm and inch** side by side (whatever the display unit).
+  A card with 25 groups therefore counts 25 times, a single-group photo once. The line
+  **Diameter P90** is the 90th percentile of the group diameters: 90 % of the groups
+  have a diameter at or below this value, which makes it a good "what I can count on"
+  figure. Selecting one record gives the statistics of that photo's groups.
 - **Average of all listed**: the same over every row currently listed (so with a
   weapon filter, the average for that weapon).
 - **Load record**: select exactly one row and reopen the stored photo copy with its
-  impacts, scale and form fields, for checking or re-measuring.
+  groups, impacts, scale and form fields, for checking or re-measuring.
 - **Delete selected**: removes the selected records after confirmation, together with
   their stored photo copies in `images\` when no other record uses them. This cannot
   be undone.
 
 ## 6. Detection parameters
 
-The defaults work for the two target styles the app was tuned on: targets with a
-solid black disc (25 m precision pistol) and ring targets with a white centre (10 m
-air rifle / pistol cards), on grey or wooden backing. Change a parameter and click
-**Analyse impacts** again to see its effect.
+The defaults work for the target styles the app was tuned on: targets with a solid
+black disc (25 m precision pistol), ring targets with a white centre (10 m air rifle /
+pistol cards) and cards of 25 small ring diagrams (.22 "Hunter"), on grey or wooden
+backing. Change a parameter and click **Analyse impacts** again to see its effect.
 
 | Parameter | Default | When to change it |
 |---|---|---|
@@ -187,5 +233,8 @@ air rifle / pistol cards), on grey or wooden backing. Change a parameter and cli
 | Many false circles along a shadow edge | Retake the photo without the hard shadow, or lower *Hole max brightness*, or remove them with the Remove tool. |
 | Every hole is split into several points | Set the scale before analysing, and check *Hole core Ø*. Or type *Shots fired*. |
 | Holes on the white paper outside the rings are missed on a solid-disc target | Add them with **Add impact**. |
+| Holes showing a nearly black backing (black board, very dark wood in a shadow) are missed | They cannot be told from the print by colour. Select the group and add them with **Add impact**. |
+| A card gives fewer groups than diagrams | A circle broken by the grid line or by writing is not found. Press **New** to create the missing group and click its shots, or move them with **Move impact to selected group**. |
+| A shot between two diagrams went to the wrong group | Select the right group and use **Move impact to selected group**. |
 | Cannot open a `.heic` file | Run `.\setup.ps1` again; it installs the `pillow-heif` package. |
 | The app does not start | Run `.\setup.ps1` and read its last lines; it checks every library. |

@@ -27,6 +27,9 @@ Pipeline
    shots; the shot count is estimated from the area (or distributed from the
    known number of shots fired) and the blob is split into that many centres
    with k-means.
+6. Every circular black shape (the band of a ring target) is a *target*; when
+   a photo shows several of them (a card of 10-25 diagrams) each impact is
+   assigned to the nearest target and the impacts form one *group* per target.
 """
 from __future__ import annotations
 
@@ -51,7 +54,17 @@ class Impact:
     count: int = 1    # shots represented by this point (always 1 after splitting)
     area: float = 0.0
     manual: bool = False
-    group_id: int = -1  # id of the blob the point was split from (-1: isolated)
+    blob_id: int = -1  # id of the torn blob the point was split from (-1: isolated)
+    group: int = 0     # index into the group list (one group per target diagram)
+
+
+@dataclass
+class Group:
+    """A set of shots measured together: one diagram of a card, or one series."""
+    label: str
+    cx: float | None = None  # centre and radius (px) of the printed target the
+    cy: float | None = None  # group belongs to, when it was found in the photo
+    r: float | None = None
 
 
 @dataclass
@@ -61,6 +74,8 @@ class DetectionResult:
     blobs: list[np.ndarray] = field(default_factory=list)  # contours, for drawing
     single_hole_area: float = 0.0
     debug: dict = field(default_factory=dict)  # intermediate masks (work resolution)
+    targets: list[Disc] = field(default_factory=list)  # every circular black shape, largest first
+    groups: list[Group] = field(default_factory=list)  # impacts[i].group indexes this list
 
 
 WORK_SIZE = 1920  # longest image side used for detection; parameters are tuned for it
@@ -79,25 +94,80 @@ def ink_mask(gray: np.ndarray, ink_ratio: float = 0.45) -> np.ndarray:
     return ink
 
 
-def find_disc(gray: np.ndarray, ink_ratio: float = 0.45) -> Disc | None:
-    """Largest circular black shape: a solid disc, or the outer band of a ring target."""
+def _circular_ink_shapes(gray: np.ndarray, ink_ratio: float, min_r: float) -> list[Disc]:
+    """Every closed ink blob that is roughly a circle of radius >= min_r, largest first."""
     ink = ink_mask(gray, ink_ratio)
     f = max(gray.shape) / 1920.0
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(15 * f), _odd(15 * f)))
     closed = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, k)
     cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return None
-    c = max(cnts, key=cv2.contourArea)
-    (x, y), r = cv2.minEnclosingCircle(c)
-    if r < 0.05 * max(gray.shape):
-        return None
-    if cv2.contourArea(c) / (np.pi * r * r) < 0.7:
-        return None
-    circle = np.zeros_like(gray)
-    cv2.circle(circle, (int(x), int(y)), int(r * 0.95), 255, -1)
-    fill = cv2.countNonZero(cv2.bitwise_and(closed, circle)) / max(1, cv2.countNonZero(circle))
-    return Disc(float(x), float(y), float(r), solid=fill >= 0.75)
+    out: list[Disc] = []
+    for c in cnts:
+        (x, y), r = cv2.minEnclosingCircle(c)
+        if r < min_r or cv2.contourArea(c) / (np.pi * r * r) < 0.7:
+            continue
+        circle = np.zeros_like(gray)
+        cv2.circle(circle, (int(x), int(y)), int(r * 0.95), 255, -1)
+        fill = cv2.countNonZero(cv2.bitwise_and(closed, circle)) / max(1, cv2.countNonZero(circle))
+        out.append(Disc(float(x), float(y), float(r), solid=fill >= 0.75))
+    out.sort(key=lambda d: -d.r)
+    return out
+
+
+def find_disc(gray: np.ndarray, ink_ratio: float = 0.45) -> Disc | None:
+    """Largest circular black shape: a solid disc, or the outer band of a ring target."""
+    shapes = _circular_ink_shapes(gray, ink_ratio, 0.05 * max(gray.shape))
+    return shapes[0] if shapes else None
+
+
+def find_targets(gray: np.ndarray, ink_ratio: float = 0.45, min_r_frac: float = 0.03) -> list[Disc]:
+    """All target diagrams in the photo (circular black shapes), largest first.
+
+    Keeps the shapes whose radius is at least min_r_frac of the longest image side
+    and at least 60 % of the median radius, so the inner thin rings exposed by a
+    torn band are not taken for extra targets; a circle whose centre lies inside
+    a larger kept circle is dropped for the same reason. Reading order (rows, then
+    left to right) is what `assign_groups` uses for the labels, not this order.
+    """
+    shapes = _circular_ink_shapes(gray, ink_ratio, min_r_frac * max(gray.shape))
+    if not shapes:
+        return []
+    median_r = float(np.median([d.r for d in shapes]))
+    kept: list[Disc] = []
+    for d in shapes:  # largest first, so nesting is checked against bigger ones only
+        if d.r < 0.6 * median_r:
+            continue
+        if any(np.hypot(d.cx - k.cx, d.cy - k.cy) < k.r for k in kept):
+            continue
+        kept.append(d)
+    return kept
+
+
+def _reading_order(targets: list[Disc]) -> list[Disc]:
+    """Sort targets row by row (rows are bands of about one diameter), then left to right."""
+    if not targets:
+        return []
+    band = 1.2 * float(np.median([d.r for d in targets]))
+    return sorted(targets, key=lambda d: (round(d.cy / band), d.cx))
+
+
+def assign_groups(impacts: list[Impact], targets: list[Disc]) -> list[Group]:
+    """Give every impact the index of the nearest target; return the group list.
+
+    With fewer than two targets everything goes into a single group "G1". Each
+    target makes one group (even when no shot hit it) so the user can see the
+    empty diagrams; labels are G1, G2, ... in reading order.
+    """
+    if len(targets) < 2:
+        g = Group("G1", targets[0].cx, targets[0].cy, targets[0].r) if targets else Group("G1")
+        for imp in impacts:
+            imp.group = 0
+        return [g]
+    ordered = _reading_order(targets)
+    for imp in impacts:
+        imp.group = int(min(range(len(ordered)),
+                            key=lambda i: (ordered[i].cx - imp.x) ** 2 + (ordered[i].cy - imp.y) ** 2))
+    return [Group(f"G{i + 1}", d.cx, d.cy, d.r) for i, d in enumerate(ordered)]
 
 
 def _split_blob(contour: np.ndarray, n: int) -> list[tuple[float, float]]:
@@ -156,7 +226,15 @@ def detect_impacts(
     sat = cv2.cvtColor(blur_bgr, cv2.COLOR_BGR2HSV)[:, :, 1]
 
     paper_global = float(np.percentile(gray, 95))
-    ink = gray < ink_ratio * paper_global
+    # printed black is grey (low chroma); the dark brown of a wooden backing in
+    # shadow is just as dark but strongly coloured (orange hue, 5-25 on the
+    # OpenCV 0-180 scale), so it must stay a candidate. The hue test keeps the
+    # purple/green chromatic fringes of print edges in the ink mask.
+    hue = cv2.cvtColor(blur_bgr, cv2.COLOR_BGR2HSV)[:, :, 0]
+    chroma = blur_bgr.max(axis=2).astype(np.int16) - blur_bgr.min(axis=2).astype(np.int16)
+    dark_wood = (sat > sat_thresh) & (chroma > 40) & ((hue <= 30) | (hue >= 170))
+    ink = (gray < ink_ratio * paper_global) & ~dark_wood
+    targets = find_targets(gray, ink_ratio)
     disc = find_disc(gray, ink_ratio)
 
     # local paper level: a grey-level closing fills every dark object smaller
@@ -208,8 +286,9 @@ def detect_impacts(
     debug = {"ink": ink, "midtone": midtone, "coloured": coloured, "candidates": opened > 0}
     if disc is not None:
         disc = Disc(disc.cx / scale, disc.cy / scale, disc.r / scale, disc.solid)
+    targets = [Disc(t.cx / scale, t.cy / scale, t.r / scale, t.solid) for t in targets]
     if not blobs:
-        return DetectionResult(disc, [], [], 0.0, debug)
+        return DetectionResult(disc, [], [], 0.0, debug, targets, assign_groups([], targets))
 
     areas = np.array([cv2.contourArea(c) for c in blobs])
     if hole_area_hint:
@@ -241,9 +320,10 @@ def detect_impacts(
             counts[multi] = np.clip(est, 2, 25).astype(int)
 
     impacts: list[Impact] = []
-    for gid, (c, a, n) in enumerate(zip(blobs, areas, counts)):
+    for bid, (c, a, n) in enumerate(zip(blobs, areas, counts)):
         for (x, y) in _split_blob(c, int(n)):
             impacts.append(Impact(x / scale, y / scale, 1, float(a) / n / scale ** 2, False,
-                                  gid if n > 1 else -1))
+                                  bid if n > 1 else -1))
     blobs = [(c / scale).astype(np.int32) for c in blobs]
-    return DetectionResult(disc, impacts, blobs, single / scale ** 2, debug)
+    groups = assign_groups(impacts, targets)
+    return DetectionResult(disc, impacts, blobs, single / scale ** 2, debug, targets, groups)
